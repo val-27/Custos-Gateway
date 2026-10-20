@@ -1,0 +1,149 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: custos-all-in-one-inference
+  labels:
+    app.kubernetes.io/name: custos-inference-pod
+    app.kubernetes.io/part-of: custos
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: custos-inference-pod
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: custos-inference-pod
+        app.kubernetes.io/part-of: custos
+    spec:
+      securityContext:
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      initContainers:
+        # Native sidecar container (`restartPolicy: Always`) ensures `/var/run/custos/ext_proc.sock`
+        # is ready before Envoy starts accepting downstream requests on port 8001.
+        - name: custos-proc
+          image: custos-proc:latest
+          imagePullPolicy: IfNotPresent
+          restartPolicy: Always
+          args:
+            - "--socket-path=/var/run/custos/ext_proc.sock"
+            - "--max-nesting-depth=16"
+            - "--max-tensor-elements=16777216"
+            - "--max-message-size-mb=32"
+            - "--log-format=json"
+            - "--log-level=info"
+            - "--log-admitted=true"
+            - "--stats-interval-secs=60"
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 10001
+            runAsGroup: 10001
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+          startupProbe:
+            exec:
+              command: ["test", "-S", "/var/run/custos/ext_proc.sock"]
+            initialDelaySeconds: 1
+            periodSeconds: 1
+            failureThreshold: 10
+          resources:
+            requests:
+              cpu: "250m"
+              memory: "64Mi"
+            limits:
+              cpu: "1000m"
+              memory: "128Mi"
+          volumeMounts:
+            - name: custos-uds-vol
+              mountPath: /var/run/custos
+      containers:
+        - name: envoy
+          image: envoyproxy/envoy:v1.31-latest
+          args:
+            - "-c"
+            - "/etc/envoy/envoy.yaml"
+            - "--ComponentLogLevel"
+            - "ext_proc:info"
+          ports:
+            - name: grpc-ingress
+              containerPort: 8001
+              protocol: TCP
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 10001
+            runAsGroup: 10001
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              cpu: "500m"
+              memory: "256Mi"
+            limits:
+              cpu: "2000m"
+              memory: "512Mi"
+          volumeMounts:
+            - name: custos-uds-vol
+              mountPath: /var/run/custos
+            - name: envoy-config-vol
+              mountPath: /etc/envoy
+              readOnly: true
+
+        - name: triton
+          image: nvcr.io/nvidia/tritonserver:24.08-py3
+          args:
+            - "tritonserver"
+            - "--model-repository=/models"
+            - "--grpc-address=127.0.0.1"
+            - "--grpc-port=9001"
+            - "--http-address=127.0.0.1"
+            - "--http-port=8000"
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 1000
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              cpu: "1000m"
+              memory: "2Gi"
+            limits:
+              cpu: "4000m"
+              memory: "8Gi"
+          volumeMounts:
+            - name: model-repo
+              mountPath: /models
+              readOnly: true
+      volumes:
+        - name: custos-uds-vol
+          emptyDir:
+            medium: Memory
+            sizeLimit: 16Mi
+        - name: envoy-config-vol
+          configMap:
+            name: custos-all-in-one-envoy-config
+        - name: model-repo
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: custos-all-in-one-svc
+  labels:
+    app.kubernetes.io/name: custos-inference-pod
+    app.kubernetes.io/part-of: custos
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: custos-inference-pod
+  ports:
+    - name: grpc-kserve-v2
+      port: 8001
+      targetPort: 8001
+      protocol: TCP

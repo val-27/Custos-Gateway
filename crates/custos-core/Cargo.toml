@@ -1,0 +1,8 @@
+[package]
+name = "custos-core"
+version = "0.1.0"
+edition = "2024"
+description = "Zero-copy, no_std TLV wire scanner for KServe v2 Protobuf inference payloads"
+license = "Apache-2.0"
+
+[dependencies]

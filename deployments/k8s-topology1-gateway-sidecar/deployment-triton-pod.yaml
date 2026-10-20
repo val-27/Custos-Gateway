@@ -1,0 +1,68 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: triton-inference-deployment
+  labels:
+    app.kubernetes.io/name: triton-inference
+    app.kubernetes.io/part-of: custos
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: triton-inference
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: triton-inference
+        app.kubernetes.io/part-of: custos
+    spec:
+      containers:
+        - name: triton
+          image: nvcr.io/nvidia/tritonserver:24.08-py3
+          args:
+            - "tritonserver"
+            - "--model-repository=/models"
+            - "--grpc-port=9001"
+            - "--http-port=8000"
+            - "--metrics-port=8002"
+          ports:
+            - name: grpc-kserve
+              containerPort: 9001
+              protocol: TCP
+            - name: http-kserve
+              containerPort: 8000
+              protocol: TCP
+            - name: metrics
+              containerPort: 8002
+              protocol: TCP
+          resources:
+            requests:
+              cpu: "1000m"
+              memory: "2Gi"
+            limits:
+              cpu: "4000m"
+              memory: "8Gi"
+          volumeMounts:
+            - name: model-repo
+              mountPath: /models
+              readOnly: true
+      volumes:
+        - name: model-repo
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: triton-inference-svc
+  labels:
+    app.kubernetes.io/name: triton-inference
+    app.kubernetes.io/part-of: custos
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: triton-inference
+  ports:
+    - name: grpc-kserve
+      port: 9001
+      targetPort: 9001
+      protocol: TCP

@@ -25,6 +25,13 @@ pub enum ParseError {
     ShapeOverflow,
     /// Total tensor element count exceeded the configured admission ceiling.
     BufferCeilingExceeded { elements: i64, max_elements: i64 },
+    /// Declared tensor byte footprint (`shape_product * sizeof(datatype)`) does not match `raw_input_contents` length (CVE-2025-23320).
+    PayloadSizeMismatch {
+        expected_bytes: usize,
+        actual_bytes: usize,
+    },
+    /// Total TLV tags in a single message exceeded the configured flood ceiling (CVE-2021-22569 / CVE-2022-1941).
+    TagLimitExceeded { count: usize, max_tags: usize },
 }
 
 impl fmt::Display for ParseError {
@@ -58,6 +65,21 @@ impl fmt::Display for ParseError {
                 write!(
                     f,
                     "tensor element count {elements} exceeds admission ceiling {max_elements}"
+                )
+            }
+            Self::PayloadSizeMismatch {
+                expected_bytes,
+                actual_bytes,
+            } => {
+                write!(
+                    f,
+                    "tensor payload size mismatch: shape declares {expected_bytes} bytes, raw_input_contents has {actual_bytes} bytes"
+                )
+            }
+            Self::TagLimitExceeded { count, max_tags } => {
+                write!(
+                    f,
+                    "protobuf tag count {count} exceeds AST flood ceiling {max_tags}"
                 )
             }
         }

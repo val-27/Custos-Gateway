@@ -29,6 +29,8 @@ data:
                     stat_prefix: ingress_kserve_v2
                     codec_type: AUTO
                     generate_request_id: true
+                    stream_idle_timeout: 15s
+                    request_timeout: 30s
                     access_log:
                       - name: envoy.access_loggers.stdout
                         typed_config:
@@ -49,6 +51,11 @@ data:
                       max_concurrent_streams: 1024
                       initial_stream_window_size: 16777216
                       initial_connection_window_size: 33554432
+                      max_outbound_frames: 10000
+                      max_outbound_control_frames: 1000
+                      max_consecutive_inbound_frames_with_empty_payload: 1
+                      max_inbound_priority_frames_per_stream: 100
+                      max_inbound_window_update_frames_per_data_frame_sent: 10
                     route_config:
                       name: kserve_v2_route
                       virtual_hosts:

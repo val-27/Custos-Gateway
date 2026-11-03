@@ -7,6 +7,9 @@ pub const MAX_DEPTH: usize = 16;
 /// Default maximum tensor elements (`16,777,216` elements = 64 MiB for FP32/INT32).
 pub const DEFAULT_MAX_TENSOR_ELEMENTS: i64 = 16_777_216;
 
+/// Default maximum TLV tags permitted per message before aborting as an AST flood (CVE-2021-22569 / CVE-2022-1941).
+pub const DEFAULT_MAX_TAGS_SCANNED: usize = 1024;
+
 /// Runtime configuration for the zero-copy Protobuf wire scanner.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ScannerConfig {
@@ -14,6 +17,10 @@ pub struct ScannerConfig {
     pub max_nesting_depth: usize,
     /// Maximum total elements permitted per `InferInputTensor` shape product.
     pub max_tensor_elements: i64,
+    /// Maximum total TLV tags permitted per message (0 = unlimited).
+    pub max_tags_scanned: usize,
+    /// Enforce byte-level parity between declared `shape * sizeof(datatype)` and `raw_input_contents` (CVE-2025-23320).
+    pub enforce_payload_parity: bool,
 }
 
 impl Default for ScannerConfig {
@@ -21,6 +28,8 @@ impl Default for ScannerConfig {
         Self {
             max_nesting_depth: MAX_DEPTH,
             max_tensor_elements: DEFAULT_MAX_TENSOR_ELEMENTS,
+            max_tags_scanned: DEFAULT_MAX_TAGS_SCANNED,
+            enforce_payload_parity: true,
         }
     }
 }
@@ -48,6 +57,12 @@ pub struct ScanReport {
     pub skipped_bulk_bytes: usize,
     /// Total Protobuf TLV tags decoded during the scan.
     pub tags_scanned: usize,
+    /// Expected raw tensor byte count calculated from `shape_product * sizeof(datatype)`.
+    pub expected_raw_input_bytes: usize,
+    /// Actual byte count observed across `Root` Field 7 (`raw_input_contents`) buffers.
+    pub actual_raw_input_bytes: usize,
+    /// Number of `Root` Field 7 (`raw_input_contents`) fields encountered.
+    pub raw_input_chunks: usize,
 }
 
 /// Detailed diagnostic context captured when a payload violates admission rules.
@@ -85,6 +100,7 @@ pub struct ScopeFrame {
     pub end_offset: usize,
     pub shape_product: i64,
     pub has_shape: bool,
+    pub elem_byte_width: Option<i64>,
 }
 
 impl Default for ScopeFrame {
@@ -94,7 +110,21 @@ impl Default for ScopeFrame {
             end_offset: 0,
             shape_product: 1,
             has_shape: false,
+            elem_byte_width: None,
         }
+    }
+}
+
+/// Maps a KServe v2 `InferInputTensor.datatype` ASCII slice to its element width in bytes.
+/// Returns `None` for variable-length (`"BYTES"`) or unrecognized datatypes.
+#[inline]
+pub const fn kserve_datatype_byte_width(raw: &[u8]) -> Option<i64> {
+    match raw {
+        b"BOOL" | b"INT8" | b"UINT8" | b"FP8E4M3FN" | b"FP8E5M2" => Some(1),
+        b"INT16" | b"UINT16" | b"FP16" | b"BF16" => Some(2),
+        b"INT32" | b"UINT32" | b"FP32" => Some(4),
+        b"INT64" | b"UINT64" | b"FP64" => Some(8),
+        _ => None,
     }
 }
 
@@ -133,6 +163,14 @@ fn finalize_frame_stats(frame: &ScopeFrame, report: &mut ScanReport) {
         report.total_tensor_elements = report
             .total_tensor_elements
             .saturating_add(frame.shape_product);
+        if let Some(width) = frame.elem_byte_width
+            && let Some(tensor_bytes) = frame.shape_product.checked_mul(width)
+            && let Ok(bytes_usize) = usize::try_from(tensor_bytes)
+        {
+            report.expected_raw_input_bytes = report
+                .expected_raw_input_bytes
+                .saturating_add(bytes_usize);
+        }
     }
 }
 
@@ -368,6 +406,20 @@ fn inspect_raw_protobuf_with_offset(
             ));
         }
 
+        if config.max_tags_scanned > 0 && report.tags_scanned > config.max_tags_scanned {
+            return Err(fail(
+                ParseError::TagLimitExceeded {
+                    count: report.tags_scanned,
+                    max_tags: config.max_tags_scanned,
+                },
+                tag_offset,
+                depth,
+                last_field_number,
+                last_wire_type,
+                report,
+            ));
+        }
+
         match wire_type {
             // Wire Type 0: Base-128 Varint
             0 => {
@@ -521,11 +573,21 @@ fn inspect_raw_protobuf_with_offset(
                 }
 
                 match (current_context, field_number) {
-                    // Root string/bytes fields:
-                    // 1 = model_name, 2 = model_version, 3 = id, 7 = raw_input_contents
+                    // Root string fields:
+                    // 1 = model_name, 2 = model_version, 3 = id
                     // Skip in O(1) time without parsing interior bytes as Protobuf tags.
-                    (MsgContext::Root, 1 | 2 | 3 | 7) => {
+                    (MsgContext::Root, 1 | 2 | 3) => {
                         report.skipped_bulk_bytes = report.skipped_bulk_bytes.saturating_add(len);
+                        cursor = submsg_end;
+                    }
+
+                    // Root Field 7 (`raw_input_contents`): record byte length for CVE-2025-23320
+                    // shape-to-payload parity validation and skip in O(1) time.
+                    (MsgContext::Root, 7) => {
+                        report.skipped_bulk_bytes = report.skipped_bulk_bytes.saturating_add(len);
+                        report.actual_raw_input_bytes =
+                            report.actual_raw_input_bytes.saturating_add(len);
+                        report.raw_input_chunks = report.raw_input_chunks.saturating_add(1);
                         cursor = submsg_end;
                     }
 
@@ -546,6 +608,7 @@ fn inspect_raw_protobuf_with_offset(
                             end_offset: submsg_end,
                             shape_product: 1,
                             has_shape: false,
+                            elem_byte_width: None,
                         };
                         depth += 1;
                         report.input_tensor_count = report.input_tensor_count.saturating_add(1);
@@ -554,10 +617,19 @@ fn inspect_raw_protobuf_with_offset(
                         }
                     }
 
+                    // InputTensor Field 2 (`datatype` ASCII string, e.g. "FP32"):
+                    // Extract element byte width in O(1) for CVE-2025-23320 parity checking and skip.
+                    (MsgContext::InputTensor, 2) => {
+                        frames[depth - 1].elem_byte_width =
+                            kserve_datatype_byte_width(&slice[cursor..submsg_end]);
+                        report.skipped_bulk_bytes = report.skipped_bulk_bytes.saturating_add(len);
+                        cursor = submsg_end;
+                    }
+
                     // InputTensor string/contents fields:
-                    // 1 = name, 2 = datatype, 5 = contents
+                    // 1 = name, 5 = contents
                     // Skip in O(1) time.
-                    (MsgContext::InputTensor, 1 | 2 | 5) => {
+                    (MsgContext::InputTensor, 1 | 5) => {
                         report.skipped_bulk_bytes = report.skipped_bulk_bytes.saturating_add(len);
                         cursor = submsg_end;
                     }
@@ -626,6 +698,7 @@ fn inspect_raw_protobuf_with_offset(
                             end_offset: submsg_end,
                             shape_product: 1,
                             has_shape: false,
+                            elem_byte_width: None,
                         };
                         depth += 1;
                         if depth > report.max_depth_reached {
@@ -710,6 +783,26 @@ fn inspect_raw_protobuf_with_offset(
         }
         finalize_frame_stats(&frames[depth - 1], &mut report);
         depth -= 1;
+    }
+
+    // Enforce CVE-2025-23320 shape-to-payload buffer parity when both `raw_input_contents` (Field 7)
+    // and fixed-width typed `InferInputTensor` descriptors were present in the request.
+    if config.enforce_payload_parity
+        && report.raw_input_chunks > 0
+        && report.expected_raw_input_bytes > 0
+        && report.actual_raw_input_bytes != report.expected_raw_input_bytes
+    {
+        return Err(fail(
+            ParseError::PayloadSizeMismatch {
+                expected_bytes: report.expected_raw_input_bytes,
+                actual_bytes: report.actual_raw_input_bytes,
+            },
+            cursor,
+            0,
+            last_field_number,
+            last_wire_type,
+            report,
+        ));
     }
 
     Ok(report)

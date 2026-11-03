@@ -1,20 +1,46 @@
-# Topology 1: Dedicated Gateway Pod Sidecar
+# Kubernetes Cluster Deployment & Evaluation Guide
 
-## Architecture
-In **Topology 1**, Envoy Proxy and `custos-proc` run together inside a dedicated, CPU-bound **Ingress Gateway Pod**, decoupled from the GPU-backed **NVIDIA Triton Inference Server Pod**:
+This directory contains the Kubernetes manifests to deploy and evaluate all three unified architectures on your **2-node Kubernetes cluster**:
 
-1. **Gateway Pod (`custos-gateway-deployment`):**
-   - `custos-proc` runs as a Kubernetes Native Sidecar (`initContainers` with `restartPolicy: Always`) and binds `/var/run/custos/ext_proc.sock` (`0660`) inside a RAM-backed `emptyDir` volume (`medium: Memory`, `sizeLimit: 16Mi`).
-   - A startup probe guarantees `/var/run/custos/ext_proc.sock` exists before the main `envoy` container starts.
-   - Envoy listens on port `8001`, buffers downstream KServe v2 `ModelInferRequest` frames up to `16 MiB`, and inspects them synchronously via `envoy.filters.http.ext_proc` (`failure_mode_allow: false`, `request_body_mode: BUFFERED`).
-   - Hardened security context: `runAsNonRoot: true`, `runAsUser: 10001`, `fsGroup: 10001`, `readOnlyRootFilesystem: true`, and `capabilities: drop: ["ALL"]`.
-2. **Inference Pod (`triton-inference-deployment` & `triton-inference-svc`):**
-   - Runs NVIDIA Triton Inference Server on port `9001` behind a ClusterIP Service (`triton-inference-svc:9001`).
-   - Only requests admitted by `custos-proc` traverse the cluster network to reach Triton.
+1. **Unprotected Control (`:8001`):** Direct to `triton-inference-svc` ([`deployment-triton-pod.yaml`](./deployment-triton-pod.yaml)).
+2. **Proxy Baseline (`:8002`):** Standard Envoy HTTP/2 ingress Pod forwarding to Triton without `custos-proc` ([`deployment-envoy-baseline-pod.yaml`](./deployment-envoy-baseline-pod.yaml)).
+3. **Custos Production (`:8003` / `:8001`):** Dedicated Ingress Gateway Pod running Envoy Proxy + the `custos-proc` Kubernetes Native Sidecar sharing a RAM-backed `emptyDir` Unix Domain Socket (`/var/run/custos/ext_proc.sock`) ([`configmap-envoy.yaml`](./configmap-envoy.yaml) & [`deployment-gateway-pod.yaml`](./deployment-gateway-pod.yaml)).
 
-## Deployment
+---
+
+## 1. Deploy All Three Architectures to Your 2-Node Cluster
+
 ```bash
-kubectl apply -f deployments/k8s-topology1-gateway-sidecar/configmap-envoy.yaml
-kubectl apply -f deployments/k8s-topology1-gateway-sidecar/deployment-triton-pod.yaml
-kubectl apply -f deployments/k8s-topology1-gateway-sidecar/deployment-gateway-pod.yaml
+# 1. Build the custos-proc container image and make it available to your cluster nodes
+docker build -t custos-proc:latest ../..
+
+# 2. Apply the Triton Backend (Unprotected Control), Proxy Baseline, and Custos Production manifests
+kubectl apply -f deployment-triton-pod.yaml
+kubectl apply -f deployment-envoy-baseline-pod.yaml
+kubectl apply -f configmap-envoy.yaml
+kubectl apply -f deployment-gateway-pod.yaml
+
+# 3. Verify all Pods and Services are Ready
+kubectl get pods,svc -l app.kubernetes.io/part-of=custos
+```
+
+---
+
+## 2. Expose Ports `:8001` (Control), `:8002` (Baseline), and `:8003` (Production) for `Custos-Bench`
+
+If running `custos-bench` from outside the cluster (or from your benchmark node via port-forwarding or NodePort/ClusterIP), bind the three ports expected by `Custos-Bench/scripts/run_scientific_suite.sh`:
+
+```bash
+kubectl port-forward svc/triton-inference-svc 8001:8001 &
+kubectl port-forward svc/envoy-baseline-svc   8002:8002 &
+kubectl port-forward svc/custos-gateway-svc   8003:8003 &
+```
+
+Then execute the automated 5-trial scientific benchmark suite:
+
+```bash
+../../../Custos-Bench/scripts/run_scientific_suite.sh \
+  --mode lan \
+  --target-host <CLUSTER_NODE_OR_LOCALHOST_IP> \
+  --trials 5
 ```

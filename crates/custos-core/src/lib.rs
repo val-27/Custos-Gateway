@@ -7,9 +7,10 @@ pub mod varint;
 
 pub use error::ParseError;
 pub use scanner::{
-    DEFAULT_MAX_TENSOR_ELEMENTS, MAX_DEPTH, MsgContext, ScanFailure, ScanReport, ScannerConfig,
-    ScopeFrame, inspect_grpc_frame, inspect_payload, inspect_payload_with_report,
-    inspect_raw_protobuf, inspect_raw_protobuf_with_report,
+    DEFAULT_MAX_TAGS_SCANNED, DEFAULT_MAX_TENSOR_ELEMENTS, MAX_DEPTH, MsgContext, ScanFailure,
+    ScanReport, ScannerConfig, ScopeFrame, inspect_grpc_frame, inspect_payload,
+    inspect_payload_with_report, inspect_raw_protobuf, inspect_raw_protobuf_with_report,
+    kserve_datatype_byte_width,
 };
 pub use varint::decode_varint;
 
@@ -117,8 +118,9 @@ mod tests {
         ));
         // Field 7: raw_input_contents containing adversarial byte patterns (0xFF, 0x18, 0x1A, etc.)
         // that would trigger false positives if scanned as Protobuf tags.
-        let mut raw_floats = vec![0xFFu8; 4096];
-        for (i, b) in raw_floats.iter_mut().enumerate() {
+        // Exact FP32 byte length for [1, 3, 224, 224] = 150,528 * 4 = 602,112 bytes.
+        let mut raw_floats = vec![0xFFu8; 150_528 * 4];
+        for (i, b) in raw_floats.iter_mut().take(4096).enumerate() {
             *b = ((i * 73 + 19) & 0xFF) as u8;
         }
         msg.push(0x3A);
@@ -315,7 +317,7 @@ mod tests {
             &[1, 3, 224, 224],
             true,
         ));
-        let raw_floats = vec![0xAAu8; 2048];
+        let raw_floats = vec![0xAAu8; 150_528 * 4];
         msg.push(0x3A);
         push_varint(&mut msg, raw_floats.len() as u64);
         msg.extend_from_slice(&raw_floats);
@@ -328,8 +330,10 @@ mod tests {
         assert_eq!(report.input_tensor_count, 1);
         assert_eq!(report.max_tensor_elements_seen, 150_528);
         assert_eq!(report.total_tensor_elements, 150_528);
+        assert_eq!(report.expected_raw_input_bytes, 602_112);
+        assert_eq!(report.actual_raw_input_bytes, 602_112);
         assert_eq!(report.max_depth_reached, 1);
-        assert!(report.skipped_bulk_bytes >= 2048);
+        assert!(report.skipped_bulk_bytes >= 602_112);
 
         // Verify failure diagnostics report exact byte offset and partial stats
         let oom = wrap_grpc_frame(&build_input_tensor(
@@ -350,5 +354,51 @@ mod tests {
         assert_eq!(failure.depth_at_failure, 1);
         assert_eq!(failure.last_field_number, 3);
         assert_eq!(failure.partial_report.input_tensor_count, 1);
+    }
+
+    #[test]
+    fn test_cve_2025_23320_shape_to_payload_buffer_parity_mismatch() {
+        let config = ScannerConfig::default();
+
+        // Declare [4, 3, 224, 224] FP32 (2,408,448 bytes) but supply only 64 bytes in Field 7
+        let mut underread = Vec::new();
+        underread.extend_from_slice(b"\x0a\x08resnet50");
+        underread.extend_from_slice(&build_input_tensor(
+            "input_tensor",
+            "FP32",
+            &[4, 3, 224, 224],
+            true,
+        ));
+        underread.push(0x3A); // Field 7: raw_input_contents
+        push_varint(&mut underread, 64);
+        underread.extend_from_slice(&[0u8; 64]);
+
+        assert_eq!(
+            inspect_payload(&wrap_grpc_frame(&underread), &config),
+            Err(ParseError::PayloadSizeMismatch {
+                expected_bytes: 2_408_448,
+                actual_bytes: 64,
+            })
+        );
+    }
+
+    #[test]
+    fn test_cve_2021_22569_unknown_field_ast_flood_tag_limit() {
+        let config = ScannerConfig::default();
+        let mut flood = Vec::new();
+        flood.extend_from_slice(b"\x0a\x08resnet50");
+        // Append 1,200 shallow unknown varint fields (Tag 0x78 = Field 15, Wire Type 0)
+        for _ in 0..1200 {
+            flood.push(0x78);
+            flood.push(0x01);
+        }
+
+        assert_eq!(
+            inspect_payload(&wrap_grpc_frame(&flood), &config),
+            Err(ParseError::TagLimitExceeded {
+                count: DEFAULT_MAX_TAGS_SCANNED + 1,
+                max_tags: DEFAULT_MAX_TAGS_SCANNED,
+            })
+        );
     }
 }

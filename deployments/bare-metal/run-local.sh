@@ -28,9 +28,10 @@ if [[ "${MODE}" == "custos" ]]; then
   echo "Starting custos-proc on ${SOCKET_PATH}..."
   "${REPO_ROOT}/target/release/custos-proc" \
     --socket-path "${SOCKET_PATH}" \
-    --max-nesting-depth 16 \
-    --max-tensor-elements 16777216 \
-    --max-message-size-mb 32 &
+    --max-nesting-depth "${CUSTOS_MAX_NESTING_DEPTH:-16}" \
+    --max-tensor-elements "${CUSTOS_MAX_TENSOR_ELEMENTS:-16777216}" \
+    --max-message-size-mb "${CUSTOS_MAX_MESSAGE_SIZE_MB:-32}" \
+    --log-admitted "${CUSTOS_LOG_ADMITTED:-false}" &
   CUSTOS_PID=$!
 
   while [[ ! -S "${SOCKET_PATH}" ]]; do

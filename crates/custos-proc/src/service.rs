@@ -22,6 +22,27 @@ use tracing::{ debug, info, info_span, warn, Instrument };
 /// gRPC status code 3 = `INVALID_ARGUMENT`.
 const GRPC_STATUS_INVALID_ARGUMENT: u32 = 3;
 
+/// gRPC status code 7 = `PERMISSION_DENIED`.
+const GRPC_STATUS_PERMISSION_DENIED: u32 = 7;
+
+/// Verifies whether a gRPC `:path` is an allowlisted KServe v2 inference or read-only health RPC.
+/// Blocks management and shared-memory registration RPCs (`SystemSharedMemoryRegister` CVE-2024-0088,
+/// `CudaSharedMemoryRegister` CVE-2025-23329, `RepositoryModelLoad` CVE-2024-53880).
+#[must_use]
+pub fn is_allowed_kserve_rpc_path(path: &str) -> bool {
+    matches!(
+        path,
+        "-"
+            | "/inference.GRPCInferenceService/ModelInfer"
+            | "/inference.GRPCInferenceService/ModelStreamInfer"
+            | "/inference.GRPCInferenceService/ServerLive"
+            | "/inference.GRPCInferenceService/ServerReady"
+            | "/inference.GRPCInferenceService/ModelReady"
+            | "/inference.GRPCInferenceService/ModelMetadata"
+            | "/inference.GRPCInferenceService/ModelConfig"
+    )
+}
+
 /// Maps a `ParseError` to a static details string for Envoy's `%RESPONSE_CODE_DETAILS%` log field
 /// without allocating dynamic strings on the hot path.
 #[must_use]
@@ -38,6 +59,8 @@ pub const fn static_error_details(err: &ParseError) -> &'static str {
         ParseError::NegativeDimension(_) => "custos_denied:negative_tensor_dimension",
         ParseError::ShapeOverflow => "custos_denied:tensor_shape_overflow",
         ParseError::BufferCeilingExceeded { .. } => "custos_denied:tensor_buffer_ceiling_exceeded",
+        ParseError::PayloadSizeMismatch { .. } => "custos_denied:payload_size_mismatch",
+        ParseError::TagLimitExceeded { .. } => "custos_denied:tag_limit_exceeded",
     }
 }
 
@@ -49,6 +72,7 @@ pub struct ServiceMetrics {
     pub streams_active: AtomicU64,
     pub stream_errors: AtomicU64,
     pub headers_evaluated: AtomicU64,
+    pub headers_rejected_rpc_path: AtomicU64,
     pub bodies_evaluated: AtomicU64,
     pub bodies_admitted: AtomicU64,
     pub bodies_rejected: AtomicU64,
@@ -61,6 +85,8 @@ pub struct ServiceMetrics {
     pub rejected_shape_overflow: AtomicU64,
     pub rejected_buffer_ceiling: AtomicU64,
     pub rejected_negative_dimension: AtomicU64,
+    pub rejected_payload_size_mismatch: AtomicU64,
+    pub rejected_tag_limit: AtomicU64,
     pub rejected_eof_or_overrun: AtomicU64,
     pub rejected_frame_or_wire: AtomicU64,
 }
@@ -90,6 +116,13 @@ impl ServiceMetrics {
                 self.rejected_negative_dimension
                     .fetch_add(1, Ordering::Relaxed);
             }
+            ParseError::PayloadSizeMismatch { .. } => {
+                self.rejected_payload_size_mismatch
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            ParseError::TagLimitExceeded { .. } => {
+                self.rejected_tag_limit.fetch_add(1, Ordering::Relaxed);
+            }
             ParseError::UnexpectedEof | ParseError::SubmessageOverrun => {
                 self.rejected_eof_or_overrun.fetch_add(1, Ordering::Relaxed);
             }
@@ -112,6 +145,7 @@ impl ServiceMetrics {
             streams_active = self.streams_active.load(Ordering::Relaxed),
             stream_errors = self.stream_errors.load(Ordering::Relaxed),
             headers_evaluated = self.headers_evaluated.load(Ordering::Relaxed),
+            headers_rejected_rpc_path = self.headers_rejected_rpc_path.load(Ordering::Relaxed),
             bodies_evaluated = self.bodies_evaluated.load(Ordering::Relaxed),
             bodies_admitted = self.bodies_admitted.load(Ordering::Relaxed),
             bodies_rejected = self.bodies_rejected.load(Ordering::Relaxed),
@@ -126,6 +160,9 @@ impl ServiceMetrics {
             rejected_buffer_ceiling = self.rejected_buffer_ceiling.load(Ordering::Relaxed),
             rejected_negative_dimension =
                 self.rejected_negative_dimension.load(Ordering::Relaxed),
+            rejected_payload_size_mismatch =
+                self.rejected_payload_size_mismatch.load(Ordering::Relaxed),
+            rejected_tag_limit = self.rejected_tag_limit.load(Ordering::Relaxed),
             rejected_eof_or_overrun = self.rejected_eof_or_overrun.load(Ordering::Relaxed),
             rejected_frame_or_wire = self.rejected_frame_or_wire.load(Ordering::Relaxed),
             "custos-proc cumulative telemetry snapshot"
@@ -253,25 +290,56 @@ impl CustosExtProcService {
                     .headers_evaluated
                     .fetch_add(1, Ordering::Relaxed);
                 ctx.update_from_envoy_headers(headers);
-                debug!(
-                    event = "request_headers_received",
-                    stream_id = ctx.stream_id,
-                    request_id = %ctx.request_id,
-                    grpc_path = %ctx.grpc_path,
-                    authority = %ctx.authority,
-                    user_agent = %ctx.user_agent,
-                    content_length = %ctx.content_length,
-                    grpc_timeout = %ctx.grpc_timeout,
-                    end_of_stream = headers.end_of_stream,
-                    observability_mode = req.observability_mode,
-                    "admitted request headers; awaiting buffered gRPC inference body"
-                );
-                EnvoyResponse::RequestHeaders(HeadersResponse {
-                    response: Some(CommonResponse {
-                        status: ResponseStatus::Continue as i32,
-                        ..Default::default()
-                    }),
-                })
+                if !is_allowed_kserve_rpc_path(&ctx.grpc_path) {
+                    self.metrics
+                        .headers_rejected_rpc_path
+                        .fetch_add(1, Ordering::Relaxed);
+                    let details = "custos_denied:unauthorized_rpc_method";
+                    warn!(
+                        event = "request_headers_rejected",
+                        decision = "DENY",
+                        stream_id = ctx.stream_id,
+                        request_id = %ctx.request_id,
+                        grpc_path = %ctx.grpc_path,
+                        authority = %ctx.authority,
+                        user_agent = %ctx.user_agent,
+                        error_code = details,
+                        http_status = StatusCode::Forbidden as i32,
+                        grpc_status = GRPC_STATUS_PERMISSION_DENIED,
+                        "blocked non-allowlisted gRPC method at header stage (shared-memory/model-repo protection)"
+                    );
+                    EnvoyResponse::ImmediateResponse(ImmediateResponse {
+                        status: Some(HttpStatus {
+                            code: StatusCode::Forbidden as i32,
+                        }),
+                        headers: None,
+                        body: details.as_bytes().to_vec(),
+                        grpc_status: Some(GrpcStatus {
+                            status: GRPC_STATUS_PERMISSION_DENIED,
+                        }),
+                        details: details.to_owned(),
+                    })
+                } else {
+                    debug!(
+                        event = "request_headers_received",
+                        stream_id = ctx.stream_id,
+                        request_id = %ctx.request_id,
+                        grpc_path = %ctx.grpc_path,
+                        authority = %ctx.authority,
+                        user_agent = %ctx.user_agent,
+                        content_length = %ctx.content_length,
+                        grpc_timeout = %ctx.grpc_timeout,
+                        end_of_stream = headers.end_of_stream,
+                        observability_mode = req.observability_mode,
+                        "admitted request headers; awaiting buffered gRPC inference body"
+                    );
+                    EnvoyResponse::RequestHeaders(HeadersResponse {
+                        response: Some(CommonResponse {
+                            status: ResponseStatus::Continue as i32,
+                            ..Default::default()
+                        }),
+                    })
+                }
             }
             EnvoyRequest::ResponseHeaders(_) => EnvoyResponse::ResponseHeaders(HeadersResponse {
                 response: Some(CommonResponse {

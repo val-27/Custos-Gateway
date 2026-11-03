@@ -6,7 +6,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use clap::{Parser, ValueEnum};
-use custos_core::{DEFAULT_MAX_TENSOR_ELEMENTS, MAX_DEPTH, ScannerConfig};
+use custos_core::{
+    DEFAULT_MAX_TAGS_SCANNED, DEFAULT_MAX_TENSOR_ELEMENTS, MAX_DEPTH, ScannerConfig,
+};
 use envoy_types::pb::envoy::service::ext_proc::v3::external_processor_server::ExternalProcessorServer;
 use service::{CustosExtProcService, ServiceMetrics};
 use tokio::net::UnixListener;
@@ -50,6 +52,23 @@ pub struct CliArgs {
         default_value_t = DEFAULT_MAX_TENSOR_ELEMENTS
     )]
     pub max_tensor_elements: i64,
+
+    /// Maximum allowed Protobuf TLV tags per message before aborting as an AST flood (CVE-2021-22569).
+    #[arg(
+        long,
+        env = "CUSTOS_MAX_TAGS_SCANNED",
+        default_value_t = DEFAULT_MAX_TAGS_SCANNED
+    )]
+    pub max_tags_scanned: usize,
+
+    /// Enforce byte-level parity between declared shape product and `raw_input_contents` (CVE-2025-23320).
+    #[arg(
+        long,
+        env = "CUSTOS_ENFORCE_PAYLOAD_PARITY",
+        default_value_t = true,
+        action = clap::ArgAction::Set
+    )]
+    pub enforce_payload_parity: bool,
 
     /// Maximum gRPC message decoding size in MiB.
     #[arg(long, env = "CUSTOS_MAX_MESSAGE_SIZE_MB", default_value_t = 32)]
@@ -129,6 +148,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let scanner_config = ScannerConfig {
         max_nesting_depth: args.max_nesting_depth.min(MAX_DEPTH),
         max_tensor_elements: args.max_tensor_elements,
+        max_tags_scanned: args.max_tags_scanned,
+        enforce_payload_parity: args.enforce_payload_parity,
     };
 
     if let Some(parent) = args.socket_path.parent()
@@ -158,6 +179,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         socket_mode = "0660",
         max_nesting_depth = scanner_config.max_nesting_depth,
         max_tensor_elements = scanner_config.max_tensor_elements,
+        max_tags_scanned = scanner_config.max_tags_scanned,
+        enforce_payload_parity = scanner_config.enforce_payload_parity,
         max_message_size_mb = args.max_message_size_mb,
         max_message_bytes = max_message_bytes,
         log_format = ?args.log_format,
@@ -387,8 +410,44 @@ mod tests {
             other => panic!("expected ImmediateResponse, got {other:?}"),
         }
 
+        // 3. Test unauthorized management/shared-memory RPC method (CVE-2024-0088) -> HTTP 403 + gRPC status 7
+        let shm_headers = HttpHeaders {
+            headers: Some(HeaderMap {
+                headers: vec![HeaderValue {
+                    key: ":path".to_owned(),
+                    value: "/inference.GRPCInferenceService/SystemSharedMemoryRegister".to_owned(),
+                    raw_value: Vec::new(),
+                }],
+            }),
+            end_of_stream: false,
+            ..Default::default()
+        };
+        let shm_requests = vec![ProcessingRequest {
+            request: Some(EnvoyRequest::RequestHeaders(shm_headers)),
+            ..Default::default()
+        }];
+        let mut shm_resp_stream = client
+            .process(tokio_stream::iter(shm_requests))
+            .await
+            .expect("process shm RPC")
+            .into_inner();
+        let shm_immediate = shm_resp_stream
+            .message()
+            .await
+            .expect("shm msg")
+            .expect("shm some");
+        match shm_immediate.response {
+            Some(EnvoyResponse::ImmediateResponse(imm)) => {
+                assert_eq!(imm.status.map(|s| s.code), Some(StatusCode::Forbidden as i32));
+                assert_eq!(imm.grpc_status.map(|g| g.status), Some(7));
+                assert_eq!(imm.details, "custos_denied:unauthorized_rpc_method");
+            }
+            other => panic!("expected ImmediateResponse for unauthorized RPC, got {other:?}"),
+        }
+
         // Verify telemetry counters updated accurately
-        assert_eq!(metrics.headers_evaluated.load(Ordering::Relaxed), 1);
+        assert_eq!(metrics.headers_evaluated.load(Ordering::Relaxed), 2);
+        assert_eq!(metrics.headers_rejected_rpc_path.load(Ordering::Relaxed), 1);
         assert_eq!(metrics.bodies_evaluated.load(Ordering::Relaxed), 2);
         assert_eq!(metrics.bodies_admitted.load(Ordering::Relaxed), 1);
         assert_eq!(metrics.bodies_rejected.load(Ordering::Relaxed), 1);

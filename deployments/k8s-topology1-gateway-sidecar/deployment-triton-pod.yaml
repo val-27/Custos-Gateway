@@ -66,3 +66,7 @@ spec:
       port: 9001
       targetPort: 9001
       protocol: TCP
+    - name: grpc-control-8001
+      port: 8001
+      targetPort: 9001
+      protocol: TCP

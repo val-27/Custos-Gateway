@@ -34,10 +34,12 @@ spec:
             - "--socket-path=/var/run/custos/ext_proc.sock"
             - "--max-nesting-depth=16"
             - "--max-tensor-elements=16777216"
+            - "--max-tags-scanned=1024"
+            - "--enforce-payload-parity=true"
             - "--max-message-size-mb=32"
             - "--log-format=json"
             - "--log-level=info"
-            - "--log-admitted=true"
+            - "--log-admitted=false"
             - "--stats-interval-secs=60"
           securityContext:
             runAsNonRoot: true
@@ -69,8 +71,8 @@ spec:
           args:
             - "-c"
             - "/etc/envoy/envoy.yaml"
-            - "--ComponentLogLevel"
-            - "ext_proc:info"
+            - "--component-log-level"
+            - "ext_proc:warn"
           ports:
             - name: grpc-ingress
               containerPort: 8001
@@ -119,5 +121,9 @@ spec:
   ports:
     - name: grpc-kserve-v2
       port: 8001
+      targetPort: 8001
+      protocol: TCP
+    - name: grpc-eval-prod
+      port: 8003
       targetPort: 8001
       protocol: TCP

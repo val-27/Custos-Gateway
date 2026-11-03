@@ -1,0 +1,154 @@
+# =============================================================================
+# Proxy Baseline (Envoy Only — No Custos Sidecar)
+# =============================================================================
+# Isolates the baseline latency and CPU/RSS cost of standard Kubernetes Envoy
+# HTTP/2 ingress proxying from the custos-proc Native Sidecar.
+# =============================================================================
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: custos-envoy-baseline-config
+  labels:
+    app.kubernetes.io/name: envoy-baseline
+    app.kubernetes.io/part-of: custos
+data:
+  envoy.yaml: |
+    admin:
+      address:
+        socket_address:
+          address: 127.0.0.1
+          port_value: 9902
+
+    static_resources:
+      listeners:
+        - name: kserve_v2_baseline_listener
+          address:
+            socket_address:
+              address: 0.0.0.0
+              port_value: 8002
+          per_connection_buffer_limit_bytes: 16777216
+          filter_chains:
+            - filters:
+                - name: envoy.filters.network.http_connection_manager
+                  typed_config:
+                    "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                    stat_prefix: ingress_kserve_v2_baseline
+                    codec_type: AUTO
+                    generate_request_id: true
+                    stream_idle_timeout: 15s
+                    request_timeout: 30s
+                    http2_protocol_options:
+                      max_concurrent_streams: 1024
+                      initial_stream_window_size: 16777216
+                      initial_connection_window_size: 33554432
+                    route_config:
+                      name: kserve_v2_route
+                      virtual_hosts:
+                        - name: triton_vhost
+                          domains: ["*"]
+                          routes:
+                            - match:
+                                prefix: "/inference.GRPCInferenceService/"
+                              route:
+                                cluster: triton_upstream_cluster
+                                timeout: 30s
+                    http_filters:
+                      - name: envoy.filters.http.router
+                        typed_config:
+                          "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+
+      clusters:
+        - name: triton_upstream_cluster
+          connect_timeout: 2s
+          type: STRICT_DNS
+          lb_policy: ROUND_ROBIN
+          typed_extension_protocol_options:
+            envoy.extensions.upstreams.http.v3.HttpProtocolOptions:
+              "@type": type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions
+              explicit_http_config:
+                http2_protocol_options: {}
+          load_assignment:
+            cluster_name: triton_upstream_cluster
+            endpoints:
+              - lb_endpoints:
+                  - endpoint:
+                      address:
+                        socket_address:
+                          address: triton-inference-svc
+                          port_value: 9001
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: envoy-baseline-deployment
+  labels:
+    app.kubernetes.io/name: envoy-baseline
+    app.kubernetes.io/part-of: custos
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: envoy-baseline
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: envoy-baseline
+        app.kubernetes.io/part-of: custos
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: envoy
+          image: envoyproxy/envoy:v1.31-latest
+          args:
+            - "-c"
+            - "/etc/envoy/envoy.yaml"
+          ports:
+            - name: grpc-baseline
+              containerPort: 8002
+              protocol: TCP
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 10001
+            runAsGroup: 10001
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              cpu: "500m"
+              memory: "256Mi"
+            limits:
+              cpu: "2000m"
+              memory: "512Mi"
+          volumeMounts:
+            - name: envoy-config-vol
+              mountPath: /etc/envoy
+              readOnly: true
+      volumes:
+        - name: envoy-config-vol
+          configMap:
+            name: custos-envoy-baseline-config
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: envoy-baseline-svc
+  labels:
+    app.kubernetes.io/name: envoy-baseline
+    app.kubernetes.io/part-of: custos
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: envoy-baseline
+  ports:
+    - name: grpc-kserve-v2-baseline
+      port: 8002
+      targetPort: 8002
+      protocol: TCP

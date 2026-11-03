@@ -84,7 +84,7 @@
 <!-- ABOUT THE PROJECT -->
 ## About The Project
 
-> **Etymology:** ***Custōs*** (Latin, pronounced *KUSS-tahss* or *KUSS-tohs*) means a **keeper, guardian, protector, or custodian**. `Custos-Gateway` acts as the wire-level guardian standing in front of GPU-backed AI inference servers, inspecting and rejecting malformed or adversarial gRPC/Protobuf payloads before they ever reach the model runtime.
+
 
 ```text
                      ┌──────────────────────────────────────────────────────────┐
@@ -130,7 +130,7 @@ Custos pivoted from a kernel-bypass `AF_XDP` packet filter to an **unprivileged,
    - **Root Field `5` (`inputs` -> `InferInputTensor`):** Pushes an `MsgContext::InputTensor` frame onto the scope stack.
    - **`InferInputTensor` Field `3` (`shape`):** Supports both **packed repeated `int64`** (`Wire Type 2`, tag `0x1A`) and **unpacked repeated `int64`** (`Wire Type 0`, tag `0x18`). Each dimension is validated (`dim > 0`, rejecting negative dimensions with `ParseError::NegativeDimension`) and multiplied into a running product via `i64::checked_mul` (catching 64-bit integer wraparounds with `ParseError::ShapeOverflow`). If the product exceeds `DEFAULT_MAX_TENSOR_ELEMENTS` (`16,777,216` elements = `64 MiB` for `FP32`), `ParseError::BufferCeilingExceeded` is returned immediately.
 5. **Shape-to-Payload Buffer Parity Verification (`CVE-2025-23320`):**
-   Maps `InferInputTensor` Field `2` (`datatype`: `FP32`, `FP64`, `INT64`, `FP16`, `BF16`, `INT32`, `INT8`, `UINT8`, `BOOL`, etc.) to its exact element byte width and verifies at the end of the message that $\sum (\prod \text{dim}_i \times \text{sizeof}(\text{datatype})) == \text{len}(\text{raw\_input\_contents})$, rejecting buffer under-reads and over-reads with `ParseError::PayloadSizeMismatch`.
+   Maps `InferInputTensor` Field `2` (`datatype`: `FP32`, `FP64`, `INT64`, `FP16`, `BF16`, `INT32`, `INT8`, `UINT8`, `BOOL`, etc.) to its exact element byte width and verifies at the end of the message that $\sum (\prod \text{dim}_i \times \text{sizeof}(\text{datatype}))$ equals `len(raw_input_contents)`, rejecting buffer under-reads and over-reads with `ParseError::PayloadSizeMismatch`.
 6. **Shallow AST / Unknown-Field Flood Ceiling (`CVE-2021-22569` / `CVE-2022-1941`):**
    Bounds the total number of Protobuf TLV tags scanned per message to `DEFAULT_MAX_TAGS_SCANNED` (`1,024`), preventing shallow unknown-field floods (`D = 0..1`) from triggering $10\times$–$50\times$ `UnknownFieldSet` heap amplification in downstream C++/Java/Python parsers.
 7. **KServe v2 RPC Method Allowlisting (`CVE-2024-0088` / `CVE-2025-23329` / `CVE-2024-53880`):**

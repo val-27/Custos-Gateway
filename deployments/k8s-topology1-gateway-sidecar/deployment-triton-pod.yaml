@@ -16,11 +16,17 @@ spec:
         app.kubernetes.io/name: triton-inference
         app.kubernetes.io/part-of: custos
     spec:
+      nodeName: worker-1
       containers:
         - name: triton
-          image: nvcr.io/nvidia/tritonserver:24.08-py3
+          image: docker.io/library/python:3.11-slim
+          imagePullPolicy: Never
+          command:
+            - "/opt/host-lib/ld-linux-x86-64.so.2"
+            - "--library-path"
+            - "/opt/host-lib"
+            - "/opt/custos-bin/tritonserver"
           args:
-            - "tritonserver"
             - "--model-repository=/models"
             - "--grpc-port=9001"
             - "--http-port=8000"
@@ -29,26 +35,34 @@ spec:
             - name: grpc-kserve
               containerPort: 9001
               protocol: TCP
-            - name: http-kserve
-              containerPort: 8000
-              protocol: TCP
-            - name: metrics
-              containerPort: 8002
-              protocol: TCP
           resources:
             requests:
               cpu: "1000m"
-              memory: "2Gi"
+              memory: "512Mi"
             limits:
               cpu: "4000m"
-              memory: "8Gi"
+              memory: "4Gi"
           volumeMounts:
             - name: model-repo
               mountPath: /models
               readOnly: true
+            - name: custos-bin
+              mountPath: /opt/custos-bin
+              readOnly: true
+            - name: host-lib
+              mountPath: /opt/host-lib
+              readOnly: true
       volumes:
         - name: model-repo
           emptyDir: {}
+        - name: custos-bin
+          hostPath:
+            path: /home/user/custos-bin
+            type: Directory
+        - name: host-lib
+          hostPath:
+            path: /lib/x86_64-linux-gnu
+            type: Directory
 ---
 apiVersion: v1
 kind: Service
@@ -58,15 +72,18 @@ metadata:
     app.kubernetes.io/name: triton-inference
     app.kubernetes.io/part-of: custos
 spec:
-  type: ClusterIP
+  type: NodePort
+  clusterIP: 10.32.0.100
   selector:
     app.kubernetes.io/name: triton-inference
   ports:
     - name: grpc-kserve
       port: 9001
       targetPort: 9001
+      nodePort: 30901
       protocol: TCP
     - name: grpc-control-8001
       port: 8001
       targetPort: 9001
+      nodePort: 30801
       protocol: TCP

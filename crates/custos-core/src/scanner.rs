@@ -57,8 +57,12 @@ pub struct ScanReport {
     pub skipped_bulk_bytes: usize,
     /// Total Protobuf TLV tags decoded during the scan.
     pub tags_scanned: usize,
-    /// Expected raw tensor byte count calculated from `shape_product * sizeof(datatype)`.
+    /// Expected raw tensor byte count calculated from fixed-width `shape_product * sizeof(datatype)`.
     pub expected_raw_input_bytes: usize,
+    /// Minimum byte count required by variable-length `BYTES` tensors (`4 * shape_product` length prefixes).
+    pub min_variable_input_bytes: usize,
+    /// Whether the request contains at least one variable-length `BYTES` input tensor.
+    pub has_bytes_tensor: bool,
     /// Actual byte count observed across `Root` Field 7 (`raw_input_contents`) buffers.
     pub actual_raw_input_bytes: usize,
     /// Number of `Root` Field 7 (`raw_input_contents`) fields encountered.
@@ -89,7 +93,11 @@ pub enum MsgContext {
     Root,
     /// Nested `inference.ModelInferRequest.InferInputTensor` submessage (Field 5 of Root).
     InputTensor,
-    /// Any other submessage (`InferRequestedOutputTensor`, `InferParameter`, or unknown submessage).
+    /// Nested `inference.ModelInferRequest.InferRequestedOutputTensor` submessage (Field 6 of Root).
+    OutputTensor,
+    /// `map<string, InferParameter>` entry submessage (Field 4 of Root/InputTensor, Field 2 of OutputTensor).
+    ParameterMapEntry,
+    /// Any other submessage (`InferParameter`, `InferTensorContents`, or unknown submessage).
     GenericSubmsg,
 }
 
@@ -101,6 +109,7 @@ pub struct ScopeFrame {
     pub shape_product: i64,
     pub has_shape: bool,
     pub elem_byte_width: Option<i64>,
+    pub is_bytes_dtype: bool,
 }
 
 impl Default for ScopeFrame {
@@ -111,6 +120,7 @@ impl Default for ScopeFrame {
             shape_product: 1,
             has_shape: false,
             elem_byte_width: None,
+            is_bytes_dtype: false,
         }
     }
 }
@@ -170,6 +180,15 @@ fn finalize_frame_stats(frame: &ScopeFrame, report: &mut ScanReport) {
             report.expected_raw_input_bytes = report
                 .expected_raw_input_bytes
                 .saturating_add(bytes_usize);
+        } else if frame.is_bytes_dtype {
+            report.has_bytes_tensor = true;
+            if let Some(min_bytes) = frame.shape_product.checked_mul(4)
+                && let Ok(bytes_usize) = usize::try_from(min_bytes)
+            {
+                report.min_variable_input_bytes = report
+                    .min_variable_input_bytes
+                    .saturating_add(bytes_usize);
+            }
         }
     }
 }
@@ -581,8 +600,8 @@ fn inspect_raw_protobuf_with_offset(
                         cursor = submsg_end;
                     }
 
-                    // Root Field 7 (`raw_input_contents`): record byte length for CVE-2025-23320
-                    // shape-to-payload parity validation and skip in O(1) time.
+                    // Root Field 7 (`raw_input_contents`): record byte length for shape-to-payload
+                    // parity validation (CVE-2025-23334-class OOB read protection) and skip in O(1) time.
                     (MsgContext::Root, 7) => {
                         report.skipped_bulk_bytes = report.skipped_bulk_bytes.saturating_add(len);
                         report.actual_raw_input_bytes =
@@ -609,6 +628,7 @@ fn inspect_raw_protobuf_with_offset(
                             shape_product: 1,
                             has_shape: false,
                             elem_byte_width: None,
+                            is_bytes_dtype: false,
                         };
                         depth += 1;
                         report.input_tensor_count = report.input_tensor_count.saturating_add(1);
@@ -617,19 +637,103 @@ fn inspect_raw_protobuf_with_offset(
                         }
                     }
 
-                    // InputTensor Field 2 (`datatype` ASCII string, e.g. "FP32"):
-                    // Extract element byte width in O(1) for CVE-2025-23320 parity checking and skip.
-                    (MsgContext::InputTensor, 2) => {
-                        frames[depth - 1].elem_byte_width =
-                            kserve_datatype_byte_width(&slice[cursor..submsg_end]);
+                    // Root Field 6 (`outputs` -> `InferRequestedOutputTensor`): push OutputTensor scope.
+                    (MsgContext::Root, 6) => {
+                        if depth >= max_depth {
+                            return Err(fail(
+                                ParseError::NestingLimitExceeded(depth + 1),
+                                tag_offset,
+                                depth + 1,
+                                last_field_number,
+                                last_wire_type,
+                                report,
+                            ));
+                        }
+                        frames[depth] = ScopeFrame {
+                            context: MsgContext::OutputTensor,
+                            end_offset: submsg_end,
+                            shape_product: 1,
+                            has_shape: false,
+                            elem_byte_width: None,
+                            is_bytes_dtype: false,
+                        };
+                        depth += 1;
+                        if depth > report.max_depth_reached {
+                            report.max_depth_reached = depth;
+                        }
+                    }
+
+                    // OutputTensor Field 1 (`name` string): skip in O(1) time.
+                    (MsgContext::OutputTensor, 1) => {
                         report.skipped_bulk_bytes = report.skipped_bulk_bytes.saturating_add(len);
                         cursor = submsg_end;
                     }
 
-                    // InputTensor string/contents fields:
-                    // 1 = name, 5 = contents
-                    // Skip in O(1) time.
-                    (MsgContext::InputTensor, 1 | 5) => {
+                    // Parameter map entries (`map<string, InferParameter>`):
+                    // Root Field 4 (`ModelInferRequest.parameters`),
+                    // InputTensor Field 4 (`InferInputTensor.parameters`),
+                    // OutputTensor Field 2 (`InferRequestedOutputTensor.parameters`).
+                    // Step into as ParameterMapEntry to block CVE-2024-0088 `shared_memory_*` keys.
+                    (MsgContext::Root, 4)
+                    | (MsgContext::InputTensor, 4)
+                    | (MsgContext::OutputTensor, 2) => {
+                        if depth >= max_depth {
+                            return Err(fail(
+                                ParseError::NestingLimitExceeded(depth + 1),
+                                tag_offset,
+                                depth + 1,
+                                last_field_number,
+                                last_wire_type,
+                                report,
+                            ));
+                        }
+                        frames[depth] = ScopeFrame {
+                            context: MsgContext::ParameterMapEntry,
+                            end_offset: submsg_end,
+                            shape_product: 1,
+                            has_shape: false,
+                            elem_byte_width: None,
+                            is_bytes_dtype: false,
+                        };
+                        depth += 1;
+                        if depth > report.max_depth_reached {
+                            report.max_depth_reached = depth;
+                        }
+                    }
+
+                    // ParameterMapEntry Field 1 (`key` ASCII string):
+                    // Reject `shared_memory_*` parameter keys on ModelInfer (CVE-2024-0088).
+                    (MsgContext::ParameterMapEntry, 1) => {
+                        let key_slice = &slice[cursor..submsg_end];
+                        if key_slice.starts_with(b"shared_memory") {
+                            return Err(fail(
+                                ParseError::UnauthorizedSharedMemoryParameter,
+                                tag_offset,
+                                depth,
+                                last_field_number,
+                                last_wire_type,
+                                report,
+                            ));
+                        }
+                        report.skipped_bulk_bytes = report.skipped_bulk_bytes.saturating_add(len);
+                        cursor = submsg_end;
+                    }
+
+                    // InputTensor Field 2 (`datatype` ASCII string, e.g. "FP32" or "BYTES"):
+                    // Extract element byte width in O(1) for parity checking and skip.
+                    (MsgContext::InputTensor, 2) => {
+                        let dt_slice = &slice[cursor..submsg_end];
+                        frames[depth - 1].elem_byte_width = kserve_datatype_byte_width(dt_slice);
+                        frames[depth - 1].is_bytes_dtype = dt_slice == b"BYTES";
+                        report.skipped_bulk_bytes = report.skipped_bulk_bytes.saturating_add(len);
+                        cursor = submsg_end;
+                    }
+
+                    // InputTensor string field:
+                    // 1 = name (Field 5 `contents` is a `GenericSubmsg` submessage and must be
+                    // stepped into so nested submessage bombs on Tag 0x2A are depth-checked).
+                    // Skip `name` in O(1) time.
+                    (MsgContext::InputTensor, 1) => {
                         report.skipped_bulk_bytes = report.skipped_bulk_bytes.saturating_add(len);
                         cursor = submsg_end;
                     }
@@ -680,7 +784,7 @@ fn inspect_raw_protobuf_with_offset(
                         }
                     }
 
-                    // All other Wire Type 2 fields at any depth (e.g. parameters, outputs,
+                    // All other Wire Type 2 fields at any depth (e.g. InferParameter value,
                     // or unknown/attacker-crafted fields) are stepped into as GenericSubmsg.
                     _ => {
                         if depth >= max_depth {
@@ -699,6 +803,7 @@ fn inspect_raw_protobuf_with_offset(
                             shape_product: 1,
                             has_shape: false,
                             elem_byte_width: None,
+                            is_bytes_dtype: false,
                         };
                         depth += 1;
                         if depth > report.max_depth_reached {
@@ -785,24 +890,49 @@ fn inspect_raw_protobuf_with_offset(
         depth -= 1;
     }
 
-    // Enforce CVE-2025-23320 shape-to-payload buffer parity when both `raw_input_contents` (Field 7)
-    // and fixed-width typed `InferInputTensor` descriptors were present in the request.
-    if config.enforce_payload_parity
-        && report.raw_input_chunks > 0
-        && report.expected_raw_input_bytes > 0
-        && report.actual_raw_input_bytes != report.expected_raw_input_bytes
-    {
-        return Err(fail(
-            ParseError::PayloadSizeMismatch {
-                expected_bytes: report.expected_raw_input_bytes,
-                actual_bytes: report.actual_raw_input_bytes,
-            },
-            cursor,
-            0,
-            last_field_number,
-            last_wire_type,
-            report,
-        ));
+    // Enforce shape-to-payload buffer parity (CVE-2025-23334-class OOB read protection)
+    // when `raw_input_contents` (Field 7) is present.
+    // - If all input tensors have fixed-width types (`!report.has_bytes_tensor`), enforce exact
+    //   equality `actual_raw_input_bytes == expected_raw_input_bytes`.
+    // - If the request includes variable-length `BYTES` tensors (`report.has_bytes_tensor`),
+    //   each `BYTES` element carries a mandatory 4-byte length prefix in `raw_input_contents`,
+    //   so we enforce the lower bound `actual_raw_input_bytes >= expected_raw_input_bytes + min_variable_input_bytes`
+    //   without falsely rejecting benign single- or multi-tensor `BYTES` payloads.
+    if config.enforce_payload_parity && report.raw_input_chunks > 0 {
+        if !report.has_bytes_tensor {
+            if report.expected_raw_input_bytes > 0
+                && report.actual_raw_input_bytes != report.expected_raw_input_bytes
+            {
+                return Err(fail(
+                    ParseError::PayloadSizeMismatch {
+                        expected_bytes: report.expected_raw_input_bytes,
+                        actual_bytes: report.actual_raw_input_bytes,
+                    },
+                    cursor,
+                    0,
+                    last_field_number,
+                    last_wire_type,
+                    report,
+                ));
+            }
+        } else {
+            let min_expected = report
+                .expected_raw_input_bytes
+                .saturating_add(report.min_variable_input_bytes);
+            if report.actual_raw_input_bytes < min_expected {
+                return Err(fail(
+                    ParseError::PayloadSizeMismatch {
+                        expected_bytes: min_expected,
+                        actual_bytes: report.actual_raw_input_bytes,
+                    },
+                    cursor,
+                    0,
+                    last_field_number,
+                    last_wire_type,
+                    report,
+                ));
+            }
+        }
     }
 
     Ok(report)

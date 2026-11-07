@@ -41,6 +41,11 @@ data:
                       max_concurrent_streams: 1024
                       initial_stream_window_size: 16777216
                       initial_connection_window_size: 33554432
+                      max_outbound_frames: 10000
+                      max_outbound_control_frames: 1000
+                      max_consecutive_inbound_frames_with_empty_payload: 1
+                      max_inbound_priority_frames_per_stream: 100
+                      max_inbound_window_update_frames_per_data_frame_sent: 10
                     route_config:
                       name: kserve_v2_route
                       virtual_hosts:
@@ -53,6 +58,10 @@ data:
                                 cluster: triton_upstream_cluster
                                 timeout: 30s
                     http_filters:
+                      - name: envoy.filters.http.buffer
+                        typed_config:
+                          "@type": type.googleapis.com/envoy.extensions.filters.http.buffer.v3.Buffer
+                          max_request_bytes: 16777216
                       - name: envoy.filters.http.router
                         typed_config:
                           "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
@@ -60,7 +69,7 @@ data:
       clusters:
         - name: triton_upstream_cluster
           connect_timeout: 2s
-          type: STRICT_DNS
+          type: STATIC
           lb_policy: ROUND_ROBIN
           typed_extension_protocol_options:
             envoy.extensions.upstreams.http.v3.HttpProtocolOptions:
@@ -74,7 +83,7 @@ data:
                   - endpoint:
                       address:
                         socket_address:
-                          address: triton-inference-svc
+                          address: 10.32.0.100
                           port_value: 9001
 ---
 apiVersion: apps/v1
@@ -85,7 +94,7 @@ metadata:
     app.kubernetes.io/name: envoy-baseline
     app.kubernetes.io/part-of: custos
 spec:
-  replicas: 2
+  replicas: 1
   selector:
     matchLabels:
       app.kubernetes.io/name: envoy-baseline
@@ -95,6 +104,11 @@ spec:
         app.kubernetes.io/name: envoy-baseline
         app.kubernetes.io/part-of: custos
     spec:
+      nodeName: worker-1
+      hostAliases:
+        - ip: "10.10.10.12"
+          hostnames:
+            - "triton-inference-svc"
       securityContext:
         runAsNonRoot: true
         runAsUser: 10001
@@ -104,10 +118,18 @@ spec:
           type: RuntimeDefault
       containers:
         - name: envoy
-          image: envoyproxy/envoy:v1.31-latest
+          image: docker.io/library/python:3.11-slim
+          imagePullPolicy: Never
+          command:
+            - "/opt/host-lib/ld-linux-x86-64.so.2"
+            - "--library-path"
+            - "/opt/host-lib"
+            - "/opt/custos-bin/envoy"
           args:
             - "-c"
             - "/etc/envoy/envoy.yaml"
+            - "--base-id"
+            - "2"
           ports:
             - name: grpc-baseline
               containerPort: 8002
@@ -131,10 +153,24 @@ spec:
             - name: envoy-config-vol
               mountPath: /etc/envoy
               readOnly: true
+            - name: custos-bin
+              mountPath: /opt/custos-bin
+              readOnly: true
+            - name: host-lib
+              mountPath: /opt/host-lib
+              readOnly: true
       volumes:
         - name: envoy-config-vol
           configMap:
             name: custos-envoy-baseline-config
+        - name: custos-bin
+          hostPath:
+            path: /home/user/custos-bin
+            type: Directory
+        - name: host-lib
+          hostPath:
+            path: /lib/x86_64-linux-gnu
+            type: Directory
 ---
 apiVersion: v1
 kind: Service
@@ -144,11 +180,12 @@ metadata:
     app.kubernetes.io/name: envoy-baseline
     app.kubernetes.io/part-of: custos
 spec:
-  type: ClusterIP
+  type: NodePort
   selector:
     app.kubernetes.io/name: envoy-baseline
   ports:
     - name: grpc-kserve-v2-baseline
       port: 8002
       targetPort: 8002
+      nodePort: 30802
       protocol: TCP

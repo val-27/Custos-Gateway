@@ -61,6 +61,9 @@ pub const fn static_error_details(err: &ParseError) -> &'static str {
         ParseError::BufferCeilingExceeded { .. } => "custos_denied:tensor_buffer_ceiling_exceeded",
         ParseError::PayloadSizeMismatch { .. } => "custos_denied:payload_size_mismatch",
         ParseError::TagLimitExceeded { .. } => "custos_denied:tag_limit_exceeded",
+        ParseError::UnauthorizedSharedMemoryParameter => {
+            "custos_denied:unauthorized_shared_memory_parameter"
+        }
     }
 }
 
@@ -89,6 +92,7 @@ pub struct ServiceMetrics {
     pub rejected_tag_limit: AtomicU64,
     pub rejected_eof_or_overrun: AtomicU64,
     pub rejected_frame_or_wire: AtomicU64,
+    pub rejected_shared_memory_param: AtomicU64,
 }
 
 impl ServiceMetrics {
@@ -122,6 +126,10 @@ impl ServiceMetrics {
             }
             ParseError::TagLimitExceeded { .. } => {
                 self.rejected_tag_limit.fetch_add(1, Ordering::Relaxed);
+            }
+            ParseError::UnauthorizedSharedMemoryParameter => {
+                self.rejected_shared_memory_param
+                    .fetch_add(1, Ordering::Relaxed);
             }
             ParseError::UnexpectedEof | ParseError::SubmessageOverrun => {
                 self.rejected_eof_or_overrun.fetch_add(1, Ordering::Relaxed);
@@ -180,6 +188,7 @@ pub struct StreamRequestContext {
     pub user_agent: String,
     pub content_length: String,
     pub grpc_timeout: String,
+    pub grpc_encoding: String,
 }
 
 impl Default for StreamRequestContext {
@@ -192,6 +201,7 @@ impl Default for StreamRequestContext {
             user_agent: "-".to_owned(),
             content_length: "-".to_owned(),
             grpc_timeout: "-".to_owned(),
+            grpc_encoding: "identity".to_owned(),
         }
     }
 }
@@ -226,6 +236,7 @@ impl StreamRequestContext {
                 "user-agent" => self.user_agent = val_cow.into_owned(),
                 "content-length" => self.content_length = val_cow.into_owned(),
                 "grpc-timeout" => self.grpc_timeout = val_cow.into_owned(),
+                "grpc-encoding" => self.grpc_encoding = val_cow.into_owned(),
                 _ => {}
             }
         }
@@ -316,6 +327,34 @@ impl CustosExtProcService {
                         body: details.as_bytes().to_vec(),
                         grpc_status: Some(GrpcStatus {
                             status: GRPC_STATUS_PERMISSION_DENIED,
+                        }),
+                        details: details.to_owned(),
+                    })
+                } else if ctx.grpc_encoding != "identity" && ctx.grpc_encoding != "-" {
+                    self.metrics
+                        .rejected_frame_or_wire
+                        .fetch_add(1, Ordering::Relaxed);
+                    let details = "custos_denied:unsupported_compression";
+                    warn!(
+                        event = "request_headers_rejected",
+                        decision = "DENY",
+                        stream_id = ctx.stream_id,
+                        request_id = %ctx.request_id,
+                        grpc_path = %ctx.grpc_path,
+                        grpc_encoding = %ctx.grpc_encoding,
+                        error_code = details,
+                        http_status = StatusCode::BadRequest as i32,
+                        grpc_status = GRPC_STATUS_INVALID_ARGUMENT,
+                        "blocked compressed gRPC request at header stage (zero-copy TLV scanner requires uncompressed wire bytes)"
+                    );
+                    EnvoyResponse::ImmediateResponse(ImmediateResponse {
+                        status: Some(HttpStatus {
+                            code: StatusCode::BadRequest as i32,
+                        }),
+                        headers: None,
+                        body: details.as_bytes().to_vec(),
+                        grpc_status: Some(GrpcStatus {
+                            status: GRPC_STATUS_INVALID_ARGUMENT,
                         }),
                         details: details.to_owned(),
                     })

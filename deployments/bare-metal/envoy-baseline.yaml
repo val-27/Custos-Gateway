@@ -25,6 +25,11 @@ static_resources:
                   max_concurrent_streams: 1024
                   initial_stream_window_size: 16777216
                   initial_connection_window_size: 33554432
+                  max_outbound_frames: 10000
+                  max_outbound_control_frames: 1000
+                  max_consecutive_inbound_frames_with_empty_payload: 1
+                  max_inbound_priority_frames_per_stream: 100
+                  max_inbound_window_update_frames_per_data_frame_sent: 10
                 route_config:
                   name: kserve_v2_route
                   virtual_hosts:
@@ -37,6 +42,10 @@ static_resources:
                             cluster: triton_upstream_cluster
                             timeout: 30s
                 http_filters:
+                  - name: envoy.filters.http.buffer
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.buffer.v3.Buffer
+                      max_request_bytes: 16777216
                   - name: envoy.filters.http.router
                     typed_config:
                       "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router

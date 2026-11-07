@@ -25,13 +25,15 @@ pub enum ParseError {
     ShapeOverflow,
     /// Total tensor element count exceeded the configured admission ceiling.
     BufferCeilingExceeded { elements: i64, max_elements: i64 },
-    /// Declared tensor byte footprint (`shape_product * sizeof(datatype)`) does not match `raw_input_contents` length (CVE-2025-23320).
+    /// Declared tensor byte footprint (`shape_product * sizeof(datatype)`) does not match `raw_input_contents` length (CVE-2025-23334-class out-of-bounds tensor buffer read).
     PayloadSizeMismatch {
         expected_bytes: usize,
         actual_bytes: usize,
     },
-    /// Total TLV tags in a single message exceeded the configured flood ceiling (CVE-2021-22569 / CVE-2022-1941).
+    /// Total TLV tags in a single message exceeded the configured flood ceiling (CVE-2022-1941 / CVE-2021-22569-class AST flood).
     TagLimitExceeded { count: usize, max_tags: usize },
+    /// Disallowed `shared_memory_*` parameter key inside `ModelInferRequest` parameters map (CVE-2024-0088).
+    UnauthorizedSharedMemoryParameter,
 }
 
 impl fmt::Display for ParseError {
@@ -80,6 +82,12 @@ impl fmt::Display for ParseError {
                 write!(
                     f,
                     "protobuf tag count {count} exceeds AST flood ceiling {max_tags}"
+                )
+            }
+            Self::UnauthorizedSharedMemoryParameter => {
+                write!(
+                    f,
+                    "unauthorized shared_memory parameter in ModelInferRequest (CVE-2024-0088)"
                 )
             }
         }

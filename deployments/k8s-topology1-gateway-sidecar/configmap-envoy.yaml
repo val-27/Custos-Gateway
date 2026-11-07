@@ -111,7 +111,7 @@ data:
 
         - name: triton_upstream_cluster
           connect_timeout: 2s
-          type: STRICT_DNS
+          type: STATIC
           lb_policy: ROUND_ROBIN
           typed_extension_protocol_options:
             envoy.extensions.upstreams.http.v3.HttpProtocolOptions:
@@ -125,5 +125,5 @@ data:
                   - endpoint:
                       address:
                         socket_address:
-                          address: triton-inference-svc
+                          address: 10.32.0.100
                           port_value: 9001

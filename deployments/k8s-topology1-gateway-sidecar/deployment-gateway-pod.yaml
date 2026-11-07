@@ -6,7 +6,7 @@ metadata:
     app.kubernetes.io/name: custos-gateway
     app.kubernetes.io/part-of: custos
 spec:
-  replicas: 2
+  replicas: 1
   selector:
     matchLabels:
       app.kubernetes.io/name: custos-gateway
@@ -16,6 +16,11 @@ spec:
         app.kubernetes.io/name: custos-gateway
         app.kubernetes.io/part-of: custos
     spec:
+      nodeName: worker-1
+      hostAliases:
+        - ip: "10.10.10.12"
+          hostnames:
+            - "triton-inference-svc"
       securityContext:
         runAsNonRoot: true
         runAsUser: 10001
@@ -27,9 +32,14 @@ spec:
         # Kubernetes Native Sidecar (restartPolicy: Always) guarantees the UDS socket
         # is bound before the main Envoy Proxy container starts.
         - name: custos-proc
-          image: custos-proc:latest
-          imagePullPolicy: IfNotPresent
+          image: docker.io/library/python:3.11-slim
+          imagePullPolicy: Never
           restartPolicy: Always
+          command:
+            - "/opt/host-lib/ld-linux-x86-64.so.2"
+            - "--library-path"
+            - "/opt/host-lib"
+            - "/opt/custos-bin/custos-proc"
           args:
             - "--socket-path=/var/run/custos/ext_proc.sock"
             - "--max-nesting-depth=16"
@@ -61,18 +71,32 @@ spec:
               memory: "64Mi"
             limits:
               cpu: "1000m"
-              memory: "128Mi"
+              memory: "512Mi"
           volumeMounts:
             - name: custos-uds-vol
               mountPath: /var/run/custos
+            - name: custos-bin
+              mountPath: /opt/custos-bin
+              readOnly: true
+            - name: host-lib
+              mountPath: /opt/host-lib
+              readOnly: true
       containers:
         - name: envoy
-          image: envoyproxy/envoy:v1.31-latest
+          image: docker.io/library/python:3.11-slim
+          imagePullPolicy: Never
+          command:
+            - "/opt/host-lib/ld-linux-x86-64.so.2"
+            - "--library-path"
+            - "/opt/host-lib"
+            - "/opt/custos-bin/envoy"
           args:
             - "-c"
             - "/etc/envoy/envoy.yaml"
             - "--component-log-level"
             - "ext_proc:warn"
+            - "--base-id"
+            - "1"
           ports:
             - name: grpc-ingress
               containerPort: 8001
@@ -98,6 +122,12 @@ spec:
             - name: envoy-config-vol
               mountPath: /etc/envoy
               readOnly: true
+            - name: custos-bin
+              mountPath: /opt/custos-bin
+              readOnly: true
+            - name: host-lib
+              mountPath: /opt/host-lib
+              readOnly: true
       volumes:
         - name: custos-uds-vol
           emptyDir:
@@ -106,6 +136,14 @@ spec:
         - name: envoy-config-vol
           configMap:
             name: custos-envoy-config
+        - name: custos-bin
+          hostPath:
+            path: /home/user/custos-bin
+            type: Directory
+        - name: host-lib
+          hostPath:
+            path: /lib/x86_64-linux-gnu
+            type: Directory
 ---
 apiVersion: v1
 kind: Service
@@ -115,15 +153,17 @@ metadata:
     app.kubernetes.io/name: custos-gateway
     app.kubernetes.io/part-of: custos
 spec:
-  type: ClusterIP
+  type: NodePort
   selector:
     app.kubernetes.io/name: custos-gateway
   ports:
     - name: grpc-kserve-v2
       port: 8001
       targetPort: 8001
+      nodePort: 30811
       protocol: TCP
     - name: grpc-eval-prod
       port: 8003
       targetPort: 8001
+      nodePort: 30803
       protocol: TCP

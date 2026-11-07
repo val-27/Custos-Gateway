@@ -401,4 +401,96 @@ mod tests {
             })
         );
     }
+
+    #[test]
+    fn test_benign_bytes_tensor_single_and_multi_input_no_false_positive() {
+        let config = ScannerConfig::default();
+
+        // 1. Single-input BYTES tensor with 2 variable-length string elements ("hello", "custos_gateway")
+        let mut raw_bytes_chunk = Vec::new();
+        for s in [b"hello".as_slice(), b"custos_gateway".as_slice()] {
+            raw_bytes_chunk.extend_from_slice(&(s.len() as u32).to_le_bytes());
+            raw_bytes_chunk.extend_from_slice(s);
+        }
+        let mut single_bytes_msg = Vec::new();
+        single_bytes_msg.extend_from_slice(b"\x0a\x08text_cls");
+        single_bytes_msg.extend_from_slice(&build_input_tensor("PROMPT", "BYTES", &[1, 2], true));
+        single_bytes_msg.push(0x3A); // Field 7: raw_input_contents
+        push_varint(&mut single_bytes_msg, raw_bytes_chunk.len() as u64);
+        single_bytes_msg.extend_from_slice(&raw_bytes_chunk);
+
+        let report =
+            inspect_payload_with_report(&wrap_grpc_frame(&single_bytes_msg), &config).unwrap();
+        assert!(report.has_bytes_tensor);
+        assert_eq!(report.min_variable_input_bytes, 8);
+        assert_eq!(report.actual_raw_input_bytes, raw_bytes_chunk.len());
+
+        // 2. Multi-input request mixing fixed-width FP32 [1, 4] (16 B) + variable-length BYTES [1, 2] (27 B)
+        let mut multi_msg = Vec::new();
+        multi_msg.extend_from_slice(b"\x0a\x0amultimodal");
+        multi_msg.extend_from_slice(&build_input_tensor("IMAGE_VEC", "FP32", &[1, 4], true));
+        multi_msg.extend_from_slice(&build_input_tensor("TEXT_TOKENS", "BYTES", &[1, 2], true));
+        // Chunk 0: 16 bytes for FP32 [1, 4]
+        multi_msg.push(0x3A);
+        push_varint(&mut multi_msg, 16);
+        multi_msg.extend_from_slice(&[0u8; 16]);
+        // Chunk 1: 27 bytes for BYTES [1, 2]
+        multi_msg.push(0x3A);
+        push_varint(&mut multi_msg, raw_bytes_chunk.len() as u64);
+        multi_msg.extend_from_slice(&raw_bytes_chunk);
+
+        assert_eq!(
+            inspect_payload(&wrap_grpc_frame(&multi_msg), &config),
+            Ok(())
+        );
+
+        // 3. Malicious BYTES under-read: declares [100] BYTES elements (requires >= 400 bytes of 4B length prefixes),
+        // but supplies only 16 bytes in raw_input_contents.
+        let mut bytes_underread = Vec::new();
+        bytes_underread.extend_from_slice(b"\x0a\x08text_cls");
+        bytes_underread.extend_from_slice(&build_input_tensor("PROMPT", "BYTES", &[100], true));
+        bytes_underread.push(0x3A);
+        push_varint(&mut bytes_underread, 16);
+        bytes_underread.extend_from_slice(&[0u8; 16]);
+
+        assert_eq!(
+            inspect_payload(&wrap_grpc_frame(&bytes_underread), &config),
+            Err(ParseError::PayloadSizeMismatch {
+                expected_bytes: 400,
+                actual_bytes: 16,
+            })
+        );
+    }
+
+    #[test]
+    fn test_cve_2024_0088_shared_memory_parameters_blocked_on_model_infer() {
+        let config = ScannerConfig::default();
+
+        // Build an InferInputTensor that includes Field 4 (`parameters` map entry)
+        // with key = "shared_memory_region" and string_param = "malicious_shm"
+        let mut param_val = Vec::new();
+        param_val.extend_from_slice(b"\x12\x0dmalicious_shm"); // Field 2 (`string_param`) inside InferParameter
+        let mut map_entry = Vec::new();
+        map_entry.extend_from_slice(b"\x0a\x14shared_memory_region"); // Field 1 (`key`)
+        map_entry.push(0x12); // Field 2 (`value` -> InferParameter)
+        push_varint(&mut map_entry, param_val.len() as u64);
+        map_entry.extend_from_slice(&param_val);
+
+        let mut tensor = Vec::new();
+        tensor.extend_from_slice(b"\x0a\x0cinput_tensor\x12\x04FP32\x1a\x04\x01\x03\xe0\x01");
+        tensor.push(0x22); // Field 4 (`parameters`) inside InferInputTensor
+        push_varint(&mut tensor, map_entry.len() as u64);
+        tensor.extend_from_slice(&map_entry);
+
+        let mut msg = Vec::new();
+        msg.extend_from_slice(b"\x0a\x08resnet50");
+        msg.push(0x2A); // Root Field 5 (`inputs`)
+        push_varint(&mut msg, tensor.len() as u64);
+        msg.extend_from_slice(&tensor);
+
+        assert_eq!(
+            inspect_payload(&wrap_grpc_frame(&msg), &config),
+            Err(ParseError::UnauthorizedSharedMemoryParameter)
+        );
+    }
 }

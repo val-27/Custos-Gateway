@@ -91,13 +91,13 @@
                      │                Unprivileged Ingress Plane                │
                      │                                                          │
 Downstream Client ───┼──► Envoy Proxy (:8001) ═══[ UDS: ext_proc.sock ]═══► custos-proc
- (TLS 1.3 / HTTP/2)  │     • Terminates TLS 1.3          (0660)             (custos-core)
-                     │     • Reassembles TCP                                • Zero-alloc TLV scan
-                     │     • Demultiplexes HTTP/2                           • ≤10B varint bound
+  (HTTP/2 / gRPC)    │     • Reassembles TCP               (0660)             (custos-core)
+                     │     • Demultiplexes HTTP/2                           • Zero-alloc TLV scan
+                     │     • Buffers ≤16 MiB body                           • ≤10B varint bound
                      └───────────────┬──────────────────────────────────────────┬┘
                                      │ ALLOW (Continue)                         │ DENY (ImmediateResponse)
                                      ▼                                          ▼
-                          NVIDIA Triton Server (:9001)               HTTP 400 / gRPC INVALID_ARGUMENT (3)
+                          KServe v2 Backend (:9001)                  HTTP 400 / gRPC INVALID_ARGUMENT (3)
 ```
 
 ### Problem Statement & Architectural Rationale
@@ -127,14 +127,14 @@ Custos pivoted from a kernel-bypass `AF_XDP` packet filter to an **unprivileged,
 4. **KServe v2 Context-Aware Schema Walker & $O(1)$ Bulk Skipping:**
    Follows the KServe v2 `inference.ModelInferRequest` wire specification:
    - **Root Fields `1` (`model_name`), `2` (`model_version`), `3` (`id`), and `7` (`raw_input_contents`):** Skipped in **$O(1)$ time** by advancing the slice cursor past their length-delimited boundaries. Multi-megabyte float32 tensor buffers in Field 7 are never parsed as Protobuf tags, preventing both latency linear scans and false positives.
-   - **Root Field `5` (`inputs` -> `InferInputTensor`):** Pushes an `MsgContext::InputTensor` frame onto the scope stack.
-   - **`InferInputTensor` Field `3` (`shape`):** Supports both **packed repeated `int64`** (`Wire Type 2`, tag `0x1A`) and **unpacked repeated `int64`** (`Wire Type 0`, tag `0x18`). Each dimension is validated (`dim > 0`, rejecting negative dimensions with `ParseError::NegativeDimension`) and multiplied into a running product via `i64::checked_mul` (catching 64-bit integer wraparounds with `ParseError::ShapeOverflow`). If the product exceeds `DEFAULT_MAX_TENSOR_ELEMENTS` (`16,777,216` elements = `64 MiB` for `FP32`), `ParseError::BufferCeilingExceeded` is returned immediately.
-5. **Shape-to-Payload Buffer Parity Verification (`CVE-2025-23334`-Class OOB Read Protection):**
-   Maps `InferInputTensor` Field `2` (`datatype`: `FP32`, `FP64`, `INT64`, `FP16`, `BF16`, `INT32`, `INT8`, `UINT8`, `BOOL`, etc.) to its exact element byte width and verifies at the end of the message that $\sum (\prod \text{dim}_i \times \text{sizeof}(\text{datatype}))$ equals `len(raw_input_contents)`, rejecting buffer under-reads and over-reads with `ParseError::PayloadSizeMismatch`. For variable-length `BYTES` tensors (where each element carries a 4-byte length prefix in `raw_input_contents`), `custos-core` tracks `has_bytes_tensor` and enforces the $4 \times \prod \text{dim}_i$ lower bound without false positives on single- or multi-tensor requests.
-6. **Shallow AST / Unknown-Field Flood Ceiling (`CVE-2022-1941` / `CVE-2021-22569`-Class):**
-   Bounds the total number of Protobuf TLV tags scanned per message to `DEFAULT_MAX_TAGS_SCANNED` (`1,024`), preventing shallow unknown-field floods (`D = 0..1`) from triggering $10\times$–$50\times$ `UnknownFieldSet` heap amplification in downstream C++/Java/Python parsers.
-7. **KServe v2 RPC Method Allowlisting & `ModelInfer` Shared-Memory Parameter Guard (`CVE-2024-0088` / `CVE-2025-23329` / `CVE-2024-53880`):**
-   At the `RequestHeaders` stage in `custos-proc`, only inference and read-only health RPCs (`ModelInfer`, `ModelStreamInfer`, `ServerLive`, `ServerReady`, `ModelReady`, `ModelMetadata`, `ModelConfig`) are admitted, and non-identity `grpc-encoding` headers (`gzip`, `deflate`) are rejected. Administrative and shared-memory RPCs (`SystemSharedMemoryRegister`, `CudaSharedMemoryRegister`, `RepositoryModelLoad`, `RepositoryModelUnload`) are rejected immediately with `HTTP 403 Forbidden` and `gRPC PERMISSION_DENIED (7)` (`custos_denied:unauthorized_rpc_method`). Furthermore, because `CVE-2024-0088` can be triggered on a normal `ModelInfer` call by passing `shared_memory_region`, `shared_memory_offset`, or `shared_memory_byte_size` inside `InferInputTensor.parameters`, `InferRequestedOutputTensor.parameters`, or `ModelInferRequest.parameters`, `custos-core` inspects parameter map keys on the wire and rejects `shared_memory_*` keys with `ParseError::UnauthorizedSharedMemoryParameter`.
+   - **Root Field `5` (`inputs` -> `InferInputTensor`):** Pushes an `MsgContext::InferInputTensor` frame onto the scope stack (up to `MAX_INPUT_TENSORS = 32` per request).
+   - **`InferInputTensor` Field `3` (`shape`):** Supports both **packed repeated `int64`** (`Wire Type 2`, tag `0x1A`) and **unpacked repeated `int64`** (`Wire Type 0`, tag `0x18`). Each dimension varint is counted toward `DEFAULT_MAX_TAGS_SCANNED`, validated (`dim > 0`, rejecting non-positive dimensions with `ParseError::NegativeDimension`), and multiplied into a per-tensor and cumulative request total via `i64::checked_mul` (catching 64-bit integer wraparounds with `ParseError::ShapeOverflow`). If any tensor or cumulative request total exceeds `DEFAULT_MAX_TENSOR_ELEMENTS` (`16,777,216` elements = `64 MiB` for `FP32`/`INT32`, `128 MiB` for `FP64`), `ParseError::BufferCeilingExceeded` is returned immediately.
+5. **1-to-1 Per-Input Shape-to-Buffer Parity & `InferTensorContents` Verification:**
+   Maps `InferInputTensor` Field `2` (`datatype`: `FP32`, `FP64`, `INT64`, `FP16`, `BF16`, `INT32`, `INT8`, `UINT8`, `BOOL`, `BYTES`, etc.) to its element byte width (rejecting missing or unknown datatypes) and enforces 1-to-1 positional parity between each input tensor `i` and either its corresponding `raw_input_contents[i]` chunk (Root Field `7`) or inline `InferTensorContents` (`Field 5` inside `InferInputTensor`). Swapped chunks, missing chunks, and element-count mismatches are rejected with `ParseError::PayloadSizeMismatch`. For variable-length `BYTES` tensors, `custos-core` walks the 4-byte little-endian `u32` length prefixes inside that input's `raw_input_contents[i]` chunk to verify that exactly $\prod \text{dim}_i$ length-prefixed strings fit within the chunk without over-read. *(Note: this enforces the KServe v2 wire invariant directly; NVIDIA's `CVE-2025-23320` and `CVE-2025-23334` advisories concern Triton Python-backend shared-memory region name disclosure on oversized payloads and subsequent shared-memory OOB read.)*
+6. **Shallow Unknown-Field & Packed-Tag Ceiling (`CVE-2022-1941` / `CVE-2021-22569`-Class):**
+   Bounds the total number of Protobuf TLV tags and packed dimension/element varints scanned per message to `DEFAULT_MAX_TAGS_SCANNED` (`1,024`), mitigating Protobuf parser resource-exhaustion bug classes (`CVE-2022-1941` in `protobuf-cpp` and `CVE-2021-22569` in `protobuf-java`).
+7. **KServe v2 Unary RPC Allowlisting & `ModelInfer` Shared-Memory Parameter Guard (`CVE-2024-0088`):**
+   At the `RequestHeaders` stage in `custos-proc`, only unary inference and read-only health/metadata RPCs (`ModelInfer`, `ServerLive`, `ServerReady`, `ModelReady`, `ModelMetadata`, `ModelConfig`) are admitted, and non-identity `grpc-encoding` headers (`gzip`, `deflate`) are rejected. Administrative and shared-memory RPCs (`SystemSharedMemoryRegister`, `CudaSharedMemoryRegister`, `RepositoryModelLoad`, `RepositoryModelUnload`) are rejected immediately with `HTTP 403 Forbidden` and `gRPC PERMISSION_DENIED (7)` (`custos_denied:unauthorized_rpc_method`). Furthermore, because `CVE-2024-0088` can be triggered on an allowlisted `ModelInfer` call by injecting `shared_memory_region`, `shared_memory_offset`, or `shared_memory_byte_size` inside `InferInputTensor.parameters`, `InferRequestedOutputTensor.parameters`, or `ModelInferRequest.parameters`, `custos-core` inspects parameter map keys on the wire and rejects `shared_memory_*` keys with `ParseError::UnauthorizedSharedMemoryParameter`.
 
 ### Scientific Evaluation & Security Summary
 
@@ -142,13 +142,13 @@ Custos pivoted from a kernel-bypass `AF_XDP` packet filter to an **unprivileged,
 
 | Threat Vector / CVE Class | Corpus Payloads (`Custos-Bench`) | `Custos-Gateway` Defense Invariant | Enforcement Stage & Action |
 | :--- | :--- | :--- | :--- |
-| **Unauthorized Admin RPCs & Shared-Memory Parameters** (`CVE-2024-0088`, `CVE-2025-23329`, `CVE-2024-53880`) | `SystemSharedMemoryRegister`, `cve_2024_0088_shm_params_infer` (`shared_memory_*` on `ModelInfer`) | `:path` allowlisting + `ParameterMapEntry` `shared_memory_*` key rejection | `RequestHeaders` (`403`) & `RequestBody` (`400` / `INVALID_ARGUMENT`) |
+| **Shared-Memory Parameter Injection & Admin RPCs** (`CVE-2024-0088`) | `cve_2024_0088_shm_params_infer` (`shared_memory_*` on `ModelInfer`) + unit-tested `:path` guard | `:path` allowlisting + `ParameterMapEntry` `shared_memory_*` key rejection | `RequestHeaders` (`403`) & `RequestBody` (`400` / `INVALID_ARGUMENT`) |
 | **Recursive Submessage, `SGROUP` & Compressed Bombs** (`CVE-2024-7254`-class) | `nesting_depth_{17..500}`, `sgroup_wire_type_3_bomb`, `grpc_compressed_flag_01` | Fixed-stack depth tracker (`MAX_DEPTH = 16`), Wire Type 3/4 rejection & `flag == 0x00` enforcement | `RequestBody` $\rightarrow$ `HTTP 400` / `gRPC INVALID_ARGUMENT (3)` |
-| **Tensor Shape OOM & 64-Bit Wraparound** | `shape_neg_*`, `shape_wrap_64bit_*`, `shape_oom_massive_*` | `dim > 0`, `i64::checked_mul`, `DEFAULT_MAX_TENSOR_ELEMENTS` ceiling | `RequestBody` $\rightarrow$ `HTTP 400` / `gRPC INVALID_ARGUMENT (3)` |
-| **Tensor Buffer Under-Read / Over-Read** (`CVE-2025-23334`-class) | `shape_buffer_mismatch_underread` (`2.41 MB` declared vs. `64 B` payload) | Exact byte parity check between $\prod \text{dim}_i \times \text{sizeof}(\text{dtype})$ and Field 7 | `RequestBody` $\rightarrow$ `HTTP 400` / `gRPC INVALID_ARGUMENT (3)` |
-| **Shallow Unknown-Field AST Flood** (`CVE-2022-1941` / `CVE-2021-22569`-class) | `unknown_field_ast_flood` (`1,500` unknown tags at `D=0`) | Bounded TLV tag counter (`DEFAULT_MAX_TAGS_SCANNED = 1,024`) | `RequestBody` $\rightarrow$ `HTTP 400` / `gRPC INVALID_ARGUMENT (3)` |
-| **Malformed / Unterminated Varints** | `varint_unterminated_{11,64}`, `varint_10th_byte_overflow` | Unrolled 10-byte Base-128 decoder with 10th-byte overflow guard | `RequestBody` $\rightarrow$ `HTTP 400` / `gRPC INVALID_ARGUMENT (3)` |
-| **Benign ResNet-50 (`B=1..16`) & `BYTES` Tensors** | `benign_b1` (`602 KB`) $\rightarrow$ `benign_b16` (`9.63 MB`), `benign_bytes_tensor` | $O(1)$ slice cursor jump over `raw_input_contents` & variable-width `BYTES` bounds | `RequestBody` $\rightarrow$ `ALLOW (Continue)` (`0%` False Positive Rate) |
+| **Tensor Shape OOM & 64-Bit Wraparound** | `shape_neg_*`, `shape_wrap_64bit_*`, `shape_oom_massive_*`, `shape_reordered_tail` | `dim > 0`, `i64::checked_mul`, per-tensor & cumulative `DEFAULT_MAX_TENSOR_ELEMENTS` ceiling | `RequestBody` $\rightarrow$ `HTTP 400` / `gRPC INVALID_ARGUMENT (3)` |
+| **KServe v2 Per-Input Buffer Parity Mismatch** | `shape_buffer_mismatch_underread` (`2.41 MB` declared vs. `64 B` payload) | 1-to-1 per-input byte parity between $\prod \text{dim}_i \times \text{sizeof}(\text{dtype})$ and Field 7 / `InferTensorContents` | `RequestBody` $\rightarrow$ `HTTP 400` / `gRPC INVALID_ARGUMENT (3)` |
+| **Shallow Unknown-Field Tag Flood** (`CVE-2022-1941` / `CVE-2021-22569`-class) | `unknown_field_ast_flood` (`1,500` unknown tags at `D=0`) | Bounded TLV & packed-varint counter (`DEFAULT_MAX_TAGS_SCANNED = 1,024`) | `RequestBody` $\rightarrow$ `HTTP 400` / `gRPC INVALID_ARGUMENT (3)` |
+| **Malformed / Unterminated Varints** | `varint_unterminated_{11,64}`, `varint_10th_byte_overflow`, `varint_truncated_eof` | Unrolled 10-byte Base-128 decoder with 10th-byte overflow guard | `RequestBody` $\rightarrow$ `HTTP 400` / `gRPC INVALID_ARGUMENT (3)` |
+| **Benign ResNet-50 (`B=1..16`), `BYTES` & `D<=16`** | `benign_b1` (`602 KB`) $\rightarrow$ `benign_b16` (`9.63 MB`), `benign_bytes_tensor`, `nesting_depth_{15,16}` | $O(1)$ slice cursor jump over `raw_input_contents` & exact 4B `BYTES` prefix walk | `RequestBody` $\rightarrow$ `ALLOW (Continue)` (`0%` False Positive Rate) |
 
 ### Repository Structure
 
@@ -270,8 +270,8 @@ _For full load-generation instructions, exploit corpus synthesis, and automated 
 | `--socket-path` | `CUSTOS_SOCKET_PATH` | `/var/run/custos/ext_proc.sock` | Unix Domain Socket path bound with `0660` permissions |
 | `--max-nesting-depth` | `CUSTOS_MAX_NESTING_DEPTH` | `16` | Maximum allowed Protobuf submessage depth (`1..=16`) |
 | `--max-tensor-elements` | `CUSTOS_MAX_TENSOR_ELEMENTS` | `16777216` | Maximum shape element product per `InferInputTensor` |
-| `--max-tags-scanned` | `CUSTOS_MAX_TAGS_SCANNED` | `1024` | Maximum Protobuf TLV tags scanned per message (`CVE-2021-22569`) |
-| `--enforce-payload-parity` | `CUSTOS_ENFORCE_PAYLOAD_PARITY` | `true` | Enforce byte parity between declared tensor shape and `raw_input_contents` (`CVE-2025-23320`) |
+| `--max-tags-scanned` | `CUSTOS_MAX_TAGS_SCANNED` | `1024` | Maximum Protobuf TLV tags and packed varints scanned per message (`CVE-2022-1941` / `CVE-2021-22569`-class) |
+| `--enforce-payload-parity` | `CUSTOS_ENFORCE_PAYLOAD_PARITY` | `true` | Enforce 1-to-1 per-input byte parity between declared tensor shape and `raw_input_contents` / `InferTensorContents` |
 | `--max-message-size-mb` | `CUSTOS_MAX_MESSAGE_SIZE_MB` | `32` | Maximum gRPC message size accepted from Envoy in MiB |
 | `--log-format` | `CUSTOS_LOG_FORMAT` | `json` | Structured log output format (`json`, `compact`, `pretty`) |
 | `--log-level` | `CUSTOS_LOG_LEVEL` | `info` | Tracing filter directive when `RUST_LOG` is unset |
@@ -288,8 +288,8 @@ _For full load-generation instructions, exploit corpus synthesis, and automated 
 - [x] Zero-copy `#![no_std]` TLV wire scanner (`custos-core`) with `#![forbid(unsafe_code)]`
 - [x] Bounded 10-byte varint decoding and stack-allocated nesting depth tracker (`MAX_DEPTH = 16`)
 - [x] KServe v2 `ModelInferRequest` context-aware walker with $O(1)$ tensor buffer skipping
-- [x] Shape-to-payload byte parity verification (`CVE-2025-23320`) & unknown-field flood ceiling (`CVE-2021-22569`)
-- [x] KServe v2 RPC method allowlisting at `RequestHeaders` stage (`CVE-2024-0088`, `CVE-2025-23329`, `CVE-2024-53880`)
+- [x] 1-to-1 per-input shape-to-payload byte parity verification & unknown-field flood ceiling (`CVE-2022-1941` / `CVE-2021-22569`-class)
+- [x] KServe v2 unary RPC method allowlisting at `RequestHeaders` stage & `ModelInfer` shared-memory parameter rejection (`CVE-2024-0088`)
 - [x] Bare-metal and Kubernetes Native Sidecar (`ext_proc` over UDS) deployment topologies
 - [ ] Prometheus / OpenTelemetry metrics exporter endpoint for real-time rejection telemetry
 - [ ] Dynamic per-model tensor shape and datatype policy profiles

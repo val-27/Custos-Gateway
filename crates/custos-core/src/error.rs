@@ -23,16 +23,16 @@ pub enum ParseError {
     NegativeDimension(i64),
     /// Checked multiplication of tensor dimensions overflowed a 64-bit signed integer.
     ShapeOverflow,
-    /// Total tensor element count exceeded the configured admission ceiling.
+    /// Single-tensor or cumulative tensor element count exceeded the configured admission ceiling.
     BufferCeilingExceeded { elements: i64, max_elements: i64 },
-    /// Declared tensor byte footprint (`shape_product * sizeof(datatype)`) does not match `raw_input_contents` length (CVE-2025-23334-class out-of-bounds tensor buffer read).
+    /// Per-input tensor byte footprint (`shape_product * sizeof(datatype)`), `BYTES` 4-byte length prefixes, or `InferTensorContents` element count does not match the supplied payload buffer.
     PayloadSizeMismatch {
         expected_bytes: usize,
         actual_bytes: usize,
     },
-    /// Total TLV tags in a single message exceeded the configured flood ceiling (CVE-2022-1941 / CVE-2021-22569-class AST flood).
+    /// Total TLV tags or packed shape dimensions in a single message exceeded the configured flood ceiling (CVE-2022-1941 / CVE-2021-22569-class parser resource exhaustion).
     TagLimitExceeded { count: usize, max_tags: usize },
-    /// Disallowed `shared_memory_*` parameter key inside `ModelInferRequest` parameters map (CVE-2024-0088).
+    /// Disallowed `shared_memory_*` parameter key inside `ModelInferRequest` parameters map (CVE-2024-0088 shared-memory region parameter injection).
     UnauthorizedSharedMemoryParameter,
 }
 

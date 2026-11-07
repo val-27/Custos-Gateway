@@ -25,16 +25,14 @@ const GRPC_STATUS_INVALID_ARGUMENT: u32 = 3;
 /// gRPC status code 7 = `PERMISSION_DENIED`.
 const GRPC_STATUS_PERMISSION_DENIED: u32 = 7;
 
-/// Verifies whether a gRPC `:path` is an allowlisted KServe v2 inference or read-only health RPC.
-/// Blocks management and shared-memory registration RPCs (`SystemSharedMemoryRegister` CVE-2024-0088,
-/// `CudaSharedMemoryRegister` CVE-2025-23329, `RepositoryModelLoad` CVE-2024-53880).
+/// Verifies whether a gRPC `:path` is an allowlisted unary KServe v2 inference or read-only health RPC.
+/// Blocks management and shared-memory registration RPCs (`SystemSharedMemoryRegister`,
+/// `CudaSharedMemoryRegister`, `RepositoryModelLoad`, `RepositoryModelUnload`) and requires an explicit `:path`.
 #[must_use]
 pub fn is_allowed_kserve_rpc_path(path: &str) -> bool {
     matches!(
         path,
-        "-"
-            | "/inference.GRPCInferenceService/ModelInfer"
-            | "/inference.GRPCInferenceService/ModelStreamInfer"
+        "/inference.GRPCInferenceService/ModelInfer"
             | "/inference.GRPCInferenceService/ServerLive"
             | "/inference.GRPCInferenceService/ServerReady"
             | "/inference.GRPCInferenceService/ModelReady"

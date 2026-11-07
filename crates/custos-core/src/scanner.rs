@@ -4,10 +4,13 @@ use crate::varint::decode_varint;
 /// Compile-time maximum submessage stack depth (zero heap allocations).
 pub const MAX_DEPTH: usize = 16;
 
-/// Default maximum tensor elements (`16,777,216` elements = 64 MiB for FP32/INT32).
+/// Compile-time maximum input tensors tracked per `ModelInferRequest` (zero heap allocations).
+pub const MAX_INPUT_TENSORS: usize = 32;
+
+/// Default maximum tensor elements (`16,777,216` elements = 64 MiB for 4-byte types such as FP32/INT32).
 pub const DEFAULT_MAX_TENSOR_ELEMENTS: i64 = 16_777_216;
 
-/// Default maximum TLV tags permitted per message before aborting as an AST flood (CVE-2021-22569 / CVE-2022-1941).
+/// Default maximum TLV tags (and packed shape dimensions) permitted per message before aborting as a parser flood (CVE-2021-22569 / CVE-2022-1941-class).
 pub const DEFAULT_MAX_TAGS_SCANNED: usize = 1024;
 
 /// Runtime configuration for the zero-copy Protobuf wire scanner.
@@ -15,11 +18,11 @@ pub const DEFAULT_MAX_TAGS_SCANNED: usize = 1024;
 pub struct ScannerConfig {
     /// Maximum allowed Protobuf submessage nesting depth (up to `MAX_DEPTH = 16`).
     pub max_nesting_depth: usize,
-    /// Maximum total elements permitted per `InferInputTensor` shape product.
+    /// Maximum elements permitted per tensor and cumulatively across all `InferInputTensor`s.
     pub max_tensor_elements: i64,
-    /// Maximum total TLV tags permitted per message (0 = unlimited).
+    /// Maximum total TLV tags + packed dimensions permitted per message (0 = unlimited).
     pub max_tags_scanned: usize,
-    /// Enforce byte-level parity between declared `shape * sizeof(datatype)` and `raw_input_contents` (CVE-2025-23320).
+    /// Enforce per-input parity between declared `shape`/`datatype` and `raw_input_contents` or `InferTensorContents`.
     pub enforce_payload_parity: bool,
 }
 
@@ -35,8 +38,6 @@ impl Default for ScannerConfig {
 }
 
 /// Zero-allocation telemetry report produced by a single-pass wire scan.
-///
-/// Useful for operational logging, threshold tuning, and capacity planning in production clusters.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ScanReport {
     /// Whether the input carried a 5-byte uncompressed gRPC frame header.
@@ -53,9 +54,9 @@ pub struct ScanReport {
     pub max_tensor_elements_seen: i64,
     /// Saturating sum of elements across all `InferInputTensor` submessages in the payload.
     pub total_tensor_elements: i64,
-    /// Total bytes skipped in $O(1)$ time (strings and `raw_input_contents` float buffers).
+    /// Total bytes skipped in $O(1)$ time (strings, packed primitives, and `raw_input_contents` buffers).
     pub skipped_bulk_bytes: usize,
-    /// Total Protobuf TLV tags decoded during the scan.
+    /// Total Protobuf TLV tags (plus packed shape/contents varints) decoded during the scan.
     pub tags_scanned: usize,
     /// Expected raw tensor byte count calculated from fixed-width `shape_product * sizeof(datatype)`.
     pub expected_raw_input_bytes: usize,
@@ -93,11 +94,13 @@ pub enum MsgContext {
     Root,
     /// Nested `inference.ModelInferRequest.InferInputTensor` submessage (Field 5 of Root).
     InputTensor,
+    /// Nested `inference.InferTensorContents` submessage (Field 5 of `InferInputTensor`).
+    TensorContents,
     /// Nested `inference.ModelInferRequest.InferRequestedOutputTensor` submessage (Field 6 of Root).
     OutputTensor,
     /// `map<string, InferParameter>` entry submessage (Field 4 of Root/InputTensor, Field 2 of OutputTensor).
     ParameterMapEntry,
-    /// Any other submessage (`InferParameter`, `InferTensorContents`, or unknown submessage).
+    /// Any other submessage (`InferParameter` or unknown submessage).
     GenericSubmsg,
 }
 
@@ -108,8 +111,11 @@ pub struct ScopeFrame {
     pub end_offset: usize,
     pub shape_product: i64,
     pub has_shape: bool,
+    pub has_datatype: bool,
     pub elem_byte_width: Option<i64>,
     pub is_bytes_dtype: bool,
+    pub has_contents: bool,
+    pub contents_elements: i64,
 }
 
 impl Default for ScopeFrame {
@@ -119,10 +125,32 @@ impl Default for ScopeFrame {
             end_offset: 0,
             shape_product: 1,
             has_shape: false,
+            has_datatype: false,
             elem_byte_width: None,
             is_bytes_dtype: false,
+            has_contents: false,
+            contents_elements: 0,
         }
     }
+}
+
+/// Stack-allocated per-input tensor expectation recorded when an `InputTensor` scope completes.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct InputTensorSpec {
+    shape_product: i64,
+    has_shape: bool,
+    has_datatype: bool,
+    elem_byte_width: Option<i64>,
+    is_bytes_dtype: bool,
+    has_contents: bool,
+    contents_elements: i64,
+}
+
+/// Stack-allocated slice descriptor for a `Root` Field 7 (`raw_input_contents`) chunk.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct RawChunk {
+    start: usize,
+    len: usize,
 }
 
 /// Maps a KServe v2 `InferInputTensor.datatype` ASCII slice to its element width in bytes.
@@ -147,7 +175,7 @@ fn accumulate_dimension(
     max_tensor_elements: i64,
 ) -> Result<(), ParseError> {
     let dim = raw_u64 as i64;
-    if dim <= 0 {
+    if dim < 0 {
         return Err(ParseError::NegativeDimension(dim));
     }
     *has_shape = true;
@@ -163,34 +191,58 @@ fn accumulate_dimension(
     Ok(())
 }
 
-/// Records a completed `InputTensor` frame's shape statistics into the `ScanReport`.
+/// Validates that a `BYTES` `raw_input_contents` chunk consists of exact `expected_elements`
+/// 4-byte little-endian length-prefixed byte strings that partition the chunk with no overrun or trailing bytes.
 #[inline]
-fn finalize_frame_stats(frame: &ScopeFrame, report: &mut ScanReport) {
-    if frame.context == MsgContext::InputTensor && frame.has_shape {
-        if frame.shape_product > report.max_tensor_elements_seen {
-            report.max_tensor_elements_seen = frame.shape_product;
-        }
-        report.total_tensor_elements = report
-            .total_tensor_elements
-            .saturating_add(frame.shape_product);
-        if let Some(width) = frame.elem_byte_width
-            && let Some(tensor_bytes) = frame.shape_product.checked_mul(width)
-            && let Ok(bytes_usize) = usize::try_from(tensor_bytes)
-        {
-            report.expected_raw_input_bytes = report
-                .expected_raw_input_bytes
-                .saturating_add(bytes_usize);
-        } else if frame.is_bytes_dtype {
-            report.has_bytes_tensor = true;
-            if let Some(min_bytes) = frame.shape_product.checked_mul(4)
-                && let Ok(bytes_usize) = usize::try_from(min_bytes)
-            {
-                report.min_variable_input_bytes = report
-                    .min_variable_input_bytes
-                    .saturating_add(bytes_usize);
-            }
-        }
+fn verify_bytes_chunk(chunk: &[u8], expected_elements: usize) -> Result<(), ParseError> {
+    let min_expected = expected_elements.saturating_mul(4);
+    if chunk.len() < min_expected {
+        return Err(ParseError::PayloadSizeMismatch {
+            expected_bytes: min_expected,
+            actual_bytes: chunk.len(),
+        });
     }
+    let mut pos: usize = 0;
+    for _ in 0..expected_elements {
+        let Some(len_end) = pos.checked_add(4) else {
+            return Err(ParseError::PayloadSizeMismatch {
+                expected_bytes: min_expected,
+                actual_bytes: chunk.len(),
+            });
+        };
+        if len_end > chunk.len() {
+            return Err(ParseError::PayloadSizeMismatch {
+                expected_bytes: pos.saturating_add(4),
+                actual_bytes: chunk.len(),
+            });
+        }
+        let elem_len = u32::from_le_bytes([
+            chunk[pos],
+            chunk[pos + 1],
+            chunk[pos + 2],
+            chunk[pos + 3],
+        ]) as usize;
+        let Some(next_pos) = len_end.checked_add(elem_len) else {
+            return Err(ParseError::PayloadSizeMismatch {
+                expected_bytes: usize::MAX,
+                actual_bytes: chunk.len(),
+            });
+        };
+        if next_pos > chunk.len() {
+            return Err(ParseError::PayloadSizeMismatch {
+                expected_bytes: next_pos,
+                actual_bytes: chunk.len(),
+            });
+        }
+        pos = next_pos;
+    }
+    if pos != chunk.len() {
+        return Err(ParseError::PayloadSizeMismatch {
+            expected_bytes: pos,
+            actual_bytes: chunk.len(),
+        });
+    }
+    Ok(())
 }
 
 /// Auto-detecting entrypoint that inspects either a 5-byte gRPC length-prefixed frame
@@ -203,9 +255,6 @@ pub fn inspect_payload(slice: &[u8], config: &ScannerConfig) -> Result<(), Parse
 
 /// Auto-detecting entrypoint that returns a full [`ScanReport`] on admission or a
 /// [`ScanFailure`] with byte-offset diagnostics on rejection.
-///
-/// Note: `ScanFailure` is returned by value on the stack because `custos-core` is `#![no_std]`
-/// and performs zero heap allocations (no `Box`).
 #[allow(clippy::result_large_err)]
 pub fn inspect_payload_with_report(
     slice: &[u8],
@@ -246,8 +295,6 @@ pub fn inspect_payload_with_report(
         });
     }
 
-    // Protobuf field number 0 is never legal on the wire; a leading byte with `byte >> 3 == 0`
-    // indicates a malformed, truncated, or compressed gRPC frame header.
     if (slice[0] >> 3) == 0 {
         base_report.grpc_framed = true;
         if slice.len() < 5 {
@@ -318,6 +365,81 @@ pub fn inspect_raw_protobuf_with_report(
     inspect_raw_protobuf_with_offset(slice, config, 0, false, slice.len())
 }
 
+/// Closes a completed `ScopeFrame` and records its tensor/contents stats.
+#[inline]
+#[allow(clippy::result_large_err)]
+fn close_scope_frame(
+    frames: &mut [ScopeFrame; MAX_DEPTH],
+    popped_depth: usize,
+    input_specs: &mut [InputTensorSpec; MAX_INPUT_TENSORS],
+    input_specs_len: &mut usize,
+    report: &mut ScanReport,
+    config: &ScannerConfig,
+) -> Result<(), ParseError> {
+    let frame = frames[popped_depth];
+    match frame.context {
+        MsgContext::TensorContents => {
+            if popped_depth > 0 && frames[popped_depth - 1].context == MsgContext::InputTensor {
+                frames[popped_depth - 1].has_contents = true;
+                frames[popped_depth - 1].contents_elements = frames[popped_depth - 1]
+                    .contents_elements
+                    .saturating_add(frame.contents_elements);
+            }
+        }
+        MsgContext::InputTensor => {
+            if frame.has_shape {
+                if frame.shape_product > report.max_tensor_elements_seen {
+                    report.max_tensor_elements_seen = frame.shape_product;
+                }
+                report.total_tensor_elements = report
+                    .total_tensor_elements
+                    .saturating_add(frame.shape_product);
+                if report.total_tensor_elements > config.max_tensor_elements {
+                    return Err(ParseError::BufferCeilingExceeded {
+                        elements: report.total_tensor_elements,
+                        max_elements: config.max_tensor_elements,
+                    });
+                }
+                if let Some(width) = frame.elem_byte_width
+                    && let Some(tensor_bytes) = frame.shape_product.checked_mul(width)
+                    && let Ok(bytes_usize) = usize::try_from(tensor_bytes)
+                {
+                    report.expected_raw_input_bytes = report
+                        .expected_raw_input_bytes
+                        .saturating_add(bytes_usize);
+                } else if frame.is_bytes_dtype {
+                    report.has_bytes_tensor = true;
+                    if let Some(min_bytes) = frame.shape_product.checked_mul(4)
+                        && let Ok(bytes_usize) = usize::try_from(min_bytes)
+                    {
+                        report.min_variable_input_bytes = report
+                            .min_variable_input_bytes
+                            .saturating_add(bytes_usize);
+                    }
+                }
+            }
+            if *input_specs_len >= MAX_INPUT_TENSORS {
+                return Err(ParseError::TagLimitExceeded {
+                    count: *input_specs_len + 1,
+                    max_tags: MAX_INPUT_TENSORS,
+                });
+            }
+            input_specs[*input_specs_len] = InputTensorSpec {
+                shape_product: frame.shape_product,
+                has_shape: frame.has_shape,
+                has_datatype: frame.has_datatype,
+                elem_byte_width: frame.elem_byte_width,
+                is_bytes_dtype: frame.is_bytes_dtype,
+                has_contents: frame.has_contents,
+                contents_elements: frame.contents_elements,
+            };
+            *input_specs_len += 1;
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
 #[allow(clippy::result_large_err)]
 fn inspect_raw_protobuf_with_offset(
     slice: &[u8],
@@ -327,6 +449,11 @@ fn inspect_raw_protobuf_with_offset(
     total_payload_bytes: usize,
 ) -> Result<ScanReport, ScanFailure> {
     let mut frames: [ScopeFrame; MAX_DEPTH] = [ScopeFrame::default(); MAX_DEPTH];
+    let mut input_specs: [InputTensorSpec; MAX_INPUT_TENSORS] =
+        [InputTensorSpec::default(); MAX_INPUT_TENSORS];
+    let mut input_specs_len: usize = 0;
+    let mut raw_chunks: [RawChunk; MAX_INPUT_TENSORS] = [RawChunk::default(); MAX_INPUT_TENSORS];
+    let mut raw_chunks_len: usize = 0;
     let mut depth: usize = 0;
     let mut cursor: usize = 0;
     let max_depth = config.max_nesting_depth.min(MAX_DEPTH);
@@ -367,8 +494,24 @@ fn inspect_raw_protobuf_with_offset(
                     report,
                 ));
             }
-            finalize_frame_stats(&frames[depth - 1], &mut report);
             depth -= 1;
+            if let Err(e) = close_scope_frame(
+                &mut frames,
+                depth,
+                &mut input_specs,
+                &mut input_specs_len,
+                &mut report,
+                config,
+            ) {
+                return Err(fail(
+                    e,
+                    cursor,
+                    depth,
+                    last_field_number,
+                    last_wire_type,
+                    report,
+                ));
+            }
         }
 
         let current_context = if depth == 0 {
@@ -483,6 +626,11 @@ fn inspect_raw_protobuf_with_offset(
                             report,
                         ));
                     }
+                } else if current_context == MsgContext::TensorContents
+                    && matches!(field_number, 1..=5)
+                {
+                    frames[depth - 1].contents_elements =
+                        frames[depth - 1].contents_elements.saturating_add(1);
                 }
             }
 
@@ -517,6 +665,10 @@ fn inspect_raw_protobuf_with_offset(
                         last_wire_type,
                         report,
                     ));
+                }
+                if current_context == MsgContext::TensorContents && field_number == 7 {
+                    frames[depth - 1].contents_elements =
+                        frames[depth - 1].contents_elements.saturating_add(1);
                 }
                 cursor = next_cursor;
             }
@@ -568,8 +720,6 @@ fn inspect_raw_protobuf_with_offset(
                     ));
                 };
 
-                // Check against parent scope boundary first if inside a submessage,
-                // or overall slice boundary if at Root.
                 if depth > 0 && submsg_end > scope_end {
                     return Err(fail(
                         ParseError::SubmessageOverrun,
@@ -592,17 +742,30 @@ fn inspect_raw_protobuf_with_offset(
                 }
 
                 match (current_context, field_number) {
-                    // Root string fields:
-                    // 1 = model_name, 2 = model_version, 3 = id
-                    // Skip in O(1) time without parsing interior bytes as Protobuf tags.
+                    // Root string fields: 1 = model_name, 2 = model_version, 3 = id
                     (MsgContext::Root, 1 | 2 | 3) => {
                         report.skipped_bulk_bytes = report.skipped_bulk_bytes.saturating_add(len);
                         cursor = submsg_end;
                     }
 
-                    // Root Field 7 (`raw_input_contents`): record byte length for shape-to-payload
-                    // parity validation (CVE-2025-23334-class OOB read protection) and skip in O(1) time.
+                    // Root Field 7 (`raw_input_contents`): record per-chunk slice for 1-to-1
+                    // input tensor parity validation and skip in O(1) time.
                     (MsgContext::Root, 7) => {
+                        if raw_chunks_len >= MAX_INPUT_TENSORS {
+                            return Err(fail(
+                                ParseError::TagLimitExceeded {
+                                    count: raw_chunks_len + 1,
+                                    max_tags: MAX_INPUT_TENSORS,
+                                },
+                                tag_offset,
+                                depth,
+                                last_field_number,
+                                last_wire_type,
+                                report,
+                            ));
+                        }
+                        raw_chunks[raw_chunks_len] = RawChunk { start: cursor, len };
+                        raw_chunks_len += 1;
                         report.skipped_bulk_bytes = report.skipped_bulk_bytes.saturating_add(len);
                         report.actual_raw_input_bytes =
                             report.actual_raw_input_bytes.saturating_add(len);
@@ -625,10 +788,7 @@ fn inspect_raw_protobuf_with_offset(
                         frames[depth] = ScopeFrame {
                             context: MsgContext::InputTensor,
                             end_offset: submsg_end,
-                            shape_product: 1,
-                            has_shape: false,
-                            elem_byte_width: None,
-                            is_bytes_dtype: false,
+                            ..Default::default()
                         };
                         depth += 1;
                         report.input_tensor_count = report.input_tensor_count.saturating_add(1);
@@ -652,10 +812,7 @@ fn inspect_raw_protobuf_with_offset(
                         frames[depth] = ScopeFrame {
                             context: MsgContext::OutputTensor,
                             end_offset: submsg_end,
-                            shape_product: 1,
-                            has_shape: false,
-                            elem_byte_width: None,
-                            is_bytes_dtype: false,
+                            ..Default::default()
                         };
                         depth += 1;
                         if depth > report.max_depth_reached {
@@ -670,10 +827,7 @@ fn inspect_raw_protobuf_with_offset(
                     }
 
                     // Parameter map entries (`map<string, InferParameter>`):
-                    // Root Field 4 (`ModelInferRequest.parameters`),
-                    // InputTensor Field 4 (`InferInputTensor.parameters`),
-                    // OutputTensor Field 2 (`InferRequestedOutputTensor.parameters`).
-                    // Step into as ParameterMapEntry to block CVE-2024-0088 `shared_memory_*` keys.
+                    // Root Field 4, InputTensor Field 4, OutputTensor Field 2.
                     (MsgContext::Root, 4)
                     | (MsgContext::InputTensor, 4)
                     | (MsgContext::OutputTensor, 2) => {
@@ -690,10 +844,7 @@ fn inspect_raw_protobuf_with_offset(
                         frames[depth] = ScopeFrame {
                             context: MsgContext::ParameterMapEntry,
                             end_offset: submsg_end,
-                            shape_product: 1,
-                            has_shape: false,
-                            elem_byte_width: None,
-                            is_bytes_dtype: false,
+                            ..Default::default()
                         };
                         depth += 1;
                         if depth > report.max_depth_reached {
@@ -720,27 +871,159 @@ fn inspect_raw_protobuf_with_offset(
                     }
 
                     // InputTensor Field 2 (`datatype` ASCII string, e.g. "FP32" or "BYTES"):
-                    // Extract element byte width in O(1) for parity checking and skip.
                     (MsgContext::InputTensor, 2) => {
                         let dt_slice = &slice[cursor..submsg_end];
+                        frames[depth - 1].has_datatype = true;
                         frames[depth - 1].elem_byte_width = kserve_datatype_byte_width(dt_slice);
                         frames[depth - 1].is_bytes_dtype = dt_slice == b"BYTES";
                         report.skipped_bulk_bytes = report.skipped_bulk_bytes.saturating_add(len);
                         cursor = submsg_end;
                     }
 
-                    // InputTensor string field:
-                    // 1 = name (Field 5 `contents` is a `GenericSubmsg` submessage and must be
-                    // stepped into so nested submessage bombs on Tag 0x2A are depth-checked).
-                    // Skip `name` in O(1) time.
+                    // InputTensor Field 1 (`name` string): skip in O(1) time.
                     (MsgContext::InputTensor, 1) => {
                         report.skipped_bulk_bytes = report.skipped_bulk_bytes.saturating_add(len);
                         cursor = submsg_end;
                     }
 
+                    // InputTensor Field 5 (`contents` -> `InferTensorContents`):
+                    // Push dedicated `TensorContents` scope so packed primitive arrays are counted
+                    // accurately rather than misinterpreted as nested Protobuf messages.
+                    (MsgContext::InputTensor, 5) => {
+                        if depth >= max_depth {
+                            return Err(fail(
+                                ParseError::NestingLimitExceeded(depth + 1),
+                                tag_offset,
+                                depth + 1,
+                                last_field_number,
+                                last_wire_type,
+                                report,
+                            ));
+                        }
+                        frames[depth] = ScopeFrame {
+                            context: MsgContext::TensorContents,
+                            end_offset: submsg_end,
+                            ..Default::default()
+                        };
+                        depth += 1;
+                        if depth > report.max_depth_reached {
+                            report.max_depth_reached = depth;
+                        }
+                    }
+
+                    // TensorContents packed repeated fields:
+                    // Fields 1..=5: packed varints (bool, int32, int64, uint32, uint64).
+                    (MsgContext::TensorContents, 1..=5) => {
+                        while cursor < submsg_end {
+                            report.tags_scanned = report.tags_scanned.saturating_add(1);
+                            if config.max_tags_scanned > 0
+                                && report.tags_scanned > config.max_tags_scanned
+                            {
+                                return Err(fail(
+                                    ParseError::TagLimitExceeded {
+                                        count: report.tags_scanned,
+                                        max_tags: config.max_tags_scanned,
+                                    },
+                                    cursor,
+                                    depth,
+                                    last_field_number,
+                                    last_wire_type,
+                                    report,
+                                ));
+                            }
+                            let elem_offset = cursor;
+                            if let Err(e) = decode_varint(slice, &mut cursor) {
+                                return Err(fail(
+                                    e,
+                                    elem_offset,
+                                    depth,
+                                    last_field_number,
+                                    last_wire_type,
+                                    report,
+                                ));
+                            }
+                            if cursor > submsg_end {
+                                return Err(fail(
+                                    ParseError::SubmessageOverrun,
+                                    cursor,
+                                    depth,
+                                    last_field_number,
+                                    last_wire_type,
+                                    report,
+                                ));
+                            }
+                            frames[depth - 1].contents_elements =
+                                frames[depth - 1].contents_elements.saturating_add(1);
+                        }
+                    }
+
+                    // TensorContents Field 6 (`fp32_contents` packed fixed32):
+                    (MsgContext::TensorContents, 6) => {
+                        if len % 4 != 0 {
+                            return Err(fail(
+                                ParseError::SubmessageOverrun,
+                                len_offset,
+                                depth,
+                                last_field_number,
+                                last_wire_type,
+                                report,
+                            ));
+                        }
+                        frames[depth - 1].contents_elements = frames[depth - 1]
+                            .contents_elements
+                            .saturating_add((len / 4) as i64);
+                        report.skipped_bulk_bytes = report.skipped_bulk_bytes.saturating_add(len);
+                        cursor = submsg_end;
+                    }
+
+                    // TensorContents Field 7 (`fp64_contents` packed fixed64):
+                    (MsgContext::TensorContents, 7) => {
+                        if len % 8 != 0 {
+                            return Err(fail(
+                                ParseError::SubmessageOverrun,
+                                len_offset,
+                                depth,
+                                last_field_number,
+                                last_wire_type,
+                                report,
+                            ));
+                        }
+                        frames[depth - 1].contents_elements = frames[depth - 1]
+                            .contents_elements
+                            .saturating_add((len / 8) as i64);
+                        report.skipped_bulk_bytes = report.skipped_bulk_bytes.saturating_add(len);
+                        cursor = submsg_end;
+                    }
+
+                    // TensorContents Field 8 (`bytes_contents` repeated bytes):
+                    (MsgContext::TensorContents, 8) => {
+                        frames[depth - 1].contents_elements =
+                            frames[depth - 1].contents_elements.saturating_add(1);
+                        report.skipped_bulk_bytes = report.skipped_bulk_bytes.saturating_add(len);
+                        cursor = submsg_end;
+                    }
+
                     // InputTensor Field 3 (`shape` encoded as Packed Repeated Varints, Tag 0x1A):
+                    // Each packed dimension counts toward `tags_scanned` so a 16 MiB packed shape
+                    // of `0x01` dimensions is bounded by `max_tags_scanned`.
                     (MsgContext::InputTensor, 3) => {
                         while cursor < submsg_end {
+                            report.tags_scanned = report.tags_scanned.saturating_add(1);
+                            if config.max_tags_scanned > 0
+                                && report.tags_scanned > config.max_tags_scanned
+                            {
+                                return Err(fail(
+                                    ParseError::TagLimitExceeded {
+                                        count: report.tags_scanned,
+                                        max_tags: config.max_tags_scanned,
+                                    },
+                                    cursor,
+                                    depth,
+                                    last_field_number,
+                                    last_wire_type,
+                                    report,
+                                ));
+                            }
                             let dim_offset = cursor;
                             let raw_dim = match decode_varint(slice, &mut cursor) {
                                 Ok(d) => d,
@@ -784,8 +1067,7 @@ fn inspect_raw_protobuf_with_offset(
                         }
                     }
 
-                    // All other Wire Type 2 fields at any depth (e.g. InferParameter value,
-                    // or unknown/attacker-crafted fields) are stepped into as GenericSubmsg.
+                    // All other Wire Type 2 fields at any depth are stepped into as GenericSubmsg.
                     _ => {
                         if depth >= max_depth {
                             return Err(fail(
@@ -800,10 +1082,7 @@ fn inspect_raw_protobuf_with_offset(
                         frames[depth] = ScopeFrame {
                             context: MsgContext::GenericSubmsg,
                             end_offset: submsg_end,
-                            shape_product: 1,
-                            has_shape: false,
-                            elem_byte_width: None,
-                            is_bytes_dtype: false,
+                            ..Default::default()
                         };
                         depth += 1;
                         if depth > report.max_depth_reached {
@@ -845,6 +1124,10 @@ fn inspect_raw_protobuf_with_offset(
                         report,
                     ));
                 }
+                if current_context == MsgContext::TensorContents && field_number == 6 {
+                    frames[depth - 1].contents_elements =
+                        frames[depth - 1].contents_elements.saturating_add(1);
+                }
                 cursor = next_cursor;
             }
 
@@ -862,7 +1145,7 @@ fn inspect_raw_protobuf_with_offset(
         }
     }
 
-    // Pop any frames that end exactly at `slice.len()`; if any active frame expected more bytes,
+    // Pop any frames that end_offset == slice.len(); if any active frame expected more bytes,
     // report an overrun or unexpected EOF.
     while depth > 0 {
         let end_offset = frames[depth - 1].end_offset;
@@ -886,26 +1169,95 @@ fn inspect_raw_protobuf_with_offset(
                 report,
             ));
         }
-        finalize_frame_stats(&frames[depth - 1], &mut report);
         depth -= 1;
+        if let Err(e) = close_scope_frame(
+            &mut frames,
+            depth,
+            &mut input_specs,
+            &mut input_specs_len,
+            &mut report,
+            config,
+        ) {
+            return Err(fail(
+                e,
+                cursor,
+                depth,
+                last_field_number,
+                last_wire_type,
+                report,
+            ));
+        }
     }
 
-    // Enforce shape-to-payload buffer parity (CVE-2025-23334-class OOB read protection)
-    // when `raw_input_contents` (Field 7) is present.
-    // - If all input tensors have fixed-width types (`!report.has_bytes_tensor`), enforce exact
-    //   equality `actual_raw_input_bytes == expected_raw_input_bytes`.
-    // - If the request includes variable-length `BYTES` tensors (`report.has_bytes_tensor`),
-    //   each `BYTES` element carries a mandatory 4-byte length prefix in `raw_input_contents`,
-    //   so we enforce the lower bound `actual_raw_input_bytes >= expected_raw_input_bytes + min_variable_input_bytes`
-    //   without falsely rejecting benign single- or multi-tensor `BYTES` payloads.
-    if config.enforce_payload_parity && report.raw_input_chunks > 0 {
-        if !report.has_bytes_tensor {
-            if report.expected_raw_input_bytes > 0
-                && report.actual_raw_input_bytes != report.expected_raw_input_bytes
+    // Per-input tensor parity validation:
+    // 1. Every `InferInputTensor` must declare a valid `shape` and known `datatype` (`elem_byte_width` or `BYTES`).
+    // 2. If `InferTensorContents` (`InputTensor` Field 5) is used, `raw_input_contents` (Root Field 7) must not be
+    //    mixed in, and `contents_elements` must equal `shape_product`.
+    // 3. Otherwise, `raw_input_contents` (Root Field 7) must provide one chunk per `InferInputTensor` in exact input
+    //    order:
+    //    - Fixed-width tensors (`FP32`, `INT64`, etc.) require `chunk.len == shape_product * elem_byte_width`.
+    //    - Variable-width `BYTES` tensors require `shape_product` valid 4-byte little-endian length-prefixed strings
+    //      that partition `chunk` with zero overrun or trailing bytes.
+    if config.enforce_payload_parity && (input_specs_len > 0 || raw_chunks_len > 0) {
+        if input_specs_len == 0 && raw_chunks_len > 0 {
+            return Err(fail(
+                ParseError::PayloadSizeMismatch {
+                    expected_bytes: 0,
+                    actual_bytes: report.actual_raw_input_bytes,
+                },
+                cursor,
+                0,
+                last_field_number,
+                last_wire_type,
+                report,
+            ));
+        }
+
+        let any_inline_contents = (0..input_specs_len).any(|i| input_specs[i].has_contents);
+        if any_inline_contents && raw_chunks_len > 0 {
+            return Err(fail(
+                ParseError::PayloadSizeMismatch {
+                    expected_bytes: report.expected_raw_input_bytes,
+                    actual_bytes: report.actual_raw_input_bytes,
+                },
+                cursor,
+                0,
+                last_field_number,
+                last_wire_type,
+                report,
+            ));
+        }
+
+        if !any_inline_contents && raw_chunks_len != input_specs_len {
+            let expected_total = if report.has_bytes_tensor {
+                report
+                    .expected_raw_input_bytes
+                    .saturating_add(report.min_variable_input_bytes)
+            } else {
+                report.expected_raw_input_bytes
+            };
+            return Err(fail(
+                ParseError::PayloadSizeMismatch {
+                    expected_bytes: expected_total.max(input_specs_len),
+                    actual_bytes: report.actual_raw_input_bytes,
+                },
+                cursor,
+                0,
+                last_field_number,
+                last_wire_type,
+                report,
+            ));
+        }
+
+        for i in 0..input_specs_len {
+            let spec = input_specs[i];
+            if !spec.has_shape
+                || !spec.has_datatype
+                || (spec.elem_byte_width.is_none() && !spec.is_bytes_dtype)
             {
                 return Err(fail(
                     ParseError::PayloadSizeMismatch {
-                        expected_bytes: report.expected_raw_input_bytes,
+                        expected_bytes: 0,
                         actual_bytes: report.actual_raw_input_bytes,
                     },
                     cursor,
@@ -915,22 +1267,59 @@ fn inspect_raw_protobuf_with_offset(
                     report,
                 ));
             }
-        } else {
-            let min_expected = report
-                .expected_raw_input_bytes
-                .saturating_add(report.min_variable_input_bytes);
-            if report.actual_raw_input_bytes < min_expected {
-                return Err(fail(
-                    ParseError::PayloadSizeMismatch {
-                        expected_bytes: min_expected,
-                        actual_bytes: report.actual_raw_input_bytes,
-                    },
-                    cursor,
-                    0,
-                    last_field_number,
-                    last_wire_type,
-                    report,
-                ));
+
+            if any_inline_contents {
+                let width = spec.elem_byte_width.unwrap_or(4) as usize;
+                let expected_elems = usize::try_from(spec.shape_product).unwrap_or(usize::MAX);
+                let actual_elems = usize::try_from(spec.contents_elements).unwrap_or(0);
+                if !spec.has_contents || actual_elems != expected_elems {
+                    return Err(fail(
+                        ParseError::PayloadSizeMismatch {
+                            expected_bytes: expected_elems.saturating_mul(width),
+                            actual_bytes: actual_elems.saturating_mul(width),
+                        },
+                        cursor,
+                        0,
+                        last_field_number,
+                        last_wire_type,
+                        report,
+                    ));
+                }
+            } else {
+                let chunk = raw_chunks[i];
+                if let Some(width) = spec.elem_byte_width {
+                    let expected_chunk_bytes = spec
+                        .shape_product
+                        .checked_mul(width)
+                        .and_then(|b| usize::try_from(b).ok())
+                        .unwrap_or(usize::MAX);
+                    if chunk.len != expected_chunk_bytes {
+                        return Err(fail(
+                            ParseError::PayloadSizeMismatch {
+                                expected_bytes: expected_chunk_bytes,
+                                actual_bytes: chunk.len,
+                            },
+                            cursor,
+                            0,
+                            last_field_number,
+                            last_wire_type,
+                            report,
+                        ));
+                    }
+                } else if spec.is_bytes_dtype {
+                    let expected_elems = usize::try_from(spec.shape_product).unwrap_or(usize::MAX);
+                    let chunk_slice = &slice[chunk.start..chunk.start + chunk.len];
+                    if let Err(e) = verify_bytes_chunk(chunk_slice, expected_elems) {
+                        return Err(fail(
+                            e,
+                            chunk.start,
+                            0,
+                            last_field_number,
+                            last_wire_type,
+                            report,
+                        ));
+                    }
+                }
             }
         }
     }

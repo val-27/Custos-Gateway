@@ -7,10 +7,10 @@ pub mod varint;
 
 pub use error::ParseError;
 pub use scanner::{
-    DEFAULT_MAX_TAGS_SCANNED, DEFAULT_MAX_TENSOR_ELEMENTS, MAX_DEPTH, MsgContext, ScanFailure,
-    ScanReport, ScannerConfig, ScopeFrame, inspect_grpc_frame, inspect_payload,
-    inspect_payload_with_report, inspect_raw_protobuf, inspect_raw_protobuf_with_report,
-    kserve_datatype_byte_width,
+    DEFAULT_MAX_TAGS_SCANNED, DEFAULT_MAX_TENSOR_ELEMENTS, MAX_DEPTH, MAX_INPUT_TENSORS,
+    MsgContext, ScanFailure, ScanReport, ScannerConfig, ScopeFrame, inspect_grpc_frame,
+    inspect_payload, inspect_payload_with_report, inspect_raw_protobuf,
+    inspect_raw_protobuf_with_report, kserve_datatype_byte_width,
 };
 pub use varint::decode_varint;
 
@@ -357,7 +357,7 @@ mod tests {
     }
 
     #[test]
-    fn test_cve_2025_23320_shape_to_payload_buffer_parity_mismatch() {
+    fn test_kserve_shape_to_payload_buffer_parity_mismatch() {
         let config = ScannerConfig::default();
 
         // Declare [4, 3, 224, 224] FP32 (2,408,448 bytes) but supply only 64 bytes in Field 7
@@ -467,9 +467,9 @@ mod tests {
         let config = ScannerConfig::default();
 
         // Build an InferInputTensor that includes Field 4 (`parameters` map entry)
-        // with key = "shared_memory_region" and string_param = "malicious_shm"
+        // with key = "shared_memory_region" and string_param = "malicious_shm" (Field 3 = 0x1A)
         let mut param_val = Vec::new();
-        param_val.extend_from_slice(b"\x12\x0dmalicious_shm"); // Field 2 (`string_param`) inside InferParameter
+        param_val.extend_from_slice(b"\x1a\x0dmalicious_shm"); // Field 3 (`string_param`) inside InferParameter
         let mut map_entry = Vec::new();
         map_entry.extend_from_slice(b"\x0a\x14shared_memory_region"); // Field 1 (`key`)
         map_entry.push(0x12); // Field 2 (`value` -> InferParameter)
@@ -492,5 +492,134 @@ mod tests {
             inspect_payload(&wrap_grpc_frame(&msg), &config),
             Err(ParseError::UnauthorizedSharedMemoryParameter)
         );
+    }
+
+    #[test]
+    fn test_per_chunk_swap_and_missing_field7_and_inline_contents() {
+        let config = ScannerConfig::default();
+
+        // 1. Per-chunk swap (sums match: 16 + 4 == 4 + 16, but chunk 0 != input 0)
+        let mut swapped = Vec::new();
+        swapped.extend_from_slice(b"\x0a\x08resnet50");
+        swapped.extend_from_slice(&build_input_tensor("IN0", "FP32", &[4], true)); // expects 16 B
+        swapped.extend_from_slice(&build_input_tensor("IN1", "FP32", &[1], true)); // expects 4 B
+        // Chunk 0: 4 bytes (wrong for IN0)
+        swapped.push(0x3A);
+        push_varint(&mut swapped, 4);
+        swapped.extend_from_slice(&[0u8; 4]);
+        // Chunk 1: 16 bytes (wrong for IN1)
+        swapped.push(0x3A);
+        push_varint(&mut swapped, 16);
+        swapped.extend_from_slice(&[0u8; 16]);
+        assert_eq!(
+            inspect_payload(&wrap_grpc_frame(&swapped), &config),
+            Err(ParseError::PayloadSizeMismatch {
+                expected_bytes: 16,
+                actual_bytes: 4,
+            })
+        );
+
+        // 2. Missing Field 7 and missing Field 5 contents on an InputTensor
+        let mut no_payload = Vec::new();
+        no_payload.extend_from_slice(b"\x0a\x08resnet50");
+        no_payload.extend_from_slice(&build_input_tensor("IN0", "FP32", &[4], true));
+        assert!(matches!(
+            inspect_payload(&wrap_grpc_frame(&no_payload), &config),
+            Err(ParseError::PayloadSizeMismatch { .. })
+        ));
+
+        // 3. Inline InferTensorContents (Field 5 inside InputTensor):
+        //    3a. Benign packed fp32_contents (Field 6, Wire Type 2, 16 bytes = 4 floats with 0xFF bytes) -> Ok(())
+        let mut contents_ok = Vec::new();
+        contents_ok.push(0x32); // Field 6 (fp32_contents), Wire Type 2 (packed)
+        push_varint(&mut contents_ok, 16);
+        contents_ok.extend_from_slice(&[0xFFu8; 16]);
+        let mut tensor_ok = Vec::new();
+        tensor_ok.extend_from_slice(b"\x0a\x03IN0\x12\x04FP32\x1a\x01\x04");
+        tensor_ok.push(0x2A); // Field 5 (contents)
+        push_varint(&mut tensor_ok, contents_ok.len() as u64);
+        tensor_ok.extend_from_slice(&contents_ok);
+        let mut msg_ok = Vec::new();
+        msg_ok.extend_from_slice(b"\x0a\x08resnet50");
+        msg_ok.push(0x2A);
+        push_varint(&mut msg_ok, tensor_ok.len() as u64);
+        msg_ok.extend_from_slice(&tensor_ok);
+        assert_eq!(inspect_payload(&wrap_grpc_frame(&msg_ok), &config), Ok(()));
+
+        //    3b. Malicious InferTensorContents: shape [16777216] FP32 with only 1 unpacked fp32_contents element -> REJECT
+        let mut contents_bad = Vec::new();
+        contents_bad.push(0x35); // Field 6 (fp32_contents), Wire Type 5 (fixed32)
+        contents_bad.extend_from_slice(&[0u8; 4]);
+        let mut tensor_bad = Vec::new();
+        tensor_bad.extend_from_slice(b"\x0a\x03IN0\x12\x04FP32");
+        tensor_bad.push(0x1A);
+        let mut shape_bytes = Vec::new();
+        push_varint(&mut shape_bytes, 16_777_216);
+        push_varint(&mut tensor_bad, shape_bytes.len() as u64);
+        tensor_bad.extend_from_slice(&shape_bytes);
+        tensor_bad.push(0x2A); // Field 5 (contents)
+        push_varint(&mut tensor_bad, contents_bad.len() as u64);
+        tensor_bad.extend_from_slice(&contents_bad);
+        let mut msg_bad = Vec::new();
+        msg_bad.extend_from_slice(b"\x0a\x08resnet50");
+        msg_bad.push(0x2A);
+        push_varint(&mut msg_bad, tensor_bad.len() as u64);
+        msg_bad.extend_from_slice(&tensor_bad);
+        assert_eq!(
+            inspect_payload(&wrap_grpc_frame(&msg_bad), &config),
+            Err(ParseError::PayloadSizeMismatch {
+                expected_bytes: 16_777_216 * 4,
+                actual_bytes: 4,
+            })
+        );
+    }
+
+    #[test]
+    fn test_bytes_length_prefix_overrun_and_packed_shape_tag_limit() {
+        let config = ScannerConfig::default();
+
+        // 1. BYTES element with 4-byte little-endian length prefix (100) exceeding chunk size (8 bytes)
+        let mut bad_bytes = Vec::new();
+        bad_bytes.extend_from_slice(b"\x0a\x08text_cls");
+        bad_bytes.extend_from_slice(&build_input_tensor("PROMPT", "BYTES", &[1], true));
+        bad_bytes.push(0x3A);
+        push_varint(&mut bad_bytes, 8);
+        bad_bytes.extend_from_slice(&100u32.to_le_bytes());
+        bad_bytes.extend_from_slice(b"abcd");
+        assert_eq!(
+            inspect_payload(&wrap_grpc_frame(&bad_bytes), &config),
+            Err(ParseError::PayloadSizeMismatch {
+                expected_bytes: 104,
+                actual_bytes: 8,
+            })
+        );
+
+        // 2. Packed shape of 1,100 dimensions of `1` (product == 1, but exceeds DEFAULT_MAX_TAGS_SCANNED)
+        let ones = vec![1i64; 1100];
+        let mut packed_flood = Vec::new();
+        packed_flood.extend_from_slice(b"\x0a\x08resnet50");
+        packed_flood.extend_from_slice(&build_input_tensor("IN0", "FP32", &ones, true));
+        assert!(matches!(
+            inspect_payload(&wrap_grpc_frame(&packed_flood), &config),
+            Err(ParseError::TagLimitExceeded { .. })
+        ));
+
+        // 3. Zero-axis shape [1, 0, 224, 224] with empty raw_input_contents (0 bytes) -> Ok(())
+        let mut zero_axis = Vec::new();
+        zero_axis.extend_from_slice(b"\x0a\x08resnet50");
+        zero_axis.extend_from_slice(&build_input_tensor(
+            "IN0",
+            "FP32",
+            &[1, 0, 224, 224],
+            true,
+        ));
+        zero_axis.extend_from_slice(b"\x3a\x00");
+        assert_eq!(
+            inspect_payload(&wrap_grpc_frame(&zero_axis), &config),
+            Ok(())
+        );
+
+        // 4. Empty ModelInfer protobuf inside a valid 5-byte gRPC frame (00 00 00 00 00) -> Ok(())
+        assert_eq!(inspect_payload(&wrap_grpc_frame(&[]), &config), Ok(()));
     }
 }

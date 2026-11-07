@@ -205,9 +205,12 @@ version = "0.1.0"
 name = "custos-proc"
 version = "0.1.0"
 dependencies = [
+ "bytes",
  "clap",
  "custos-core",
  "envoy-types",
+ "http",
+ "http-body",
  "hyper-util",
  "tempfile",
  "tokio",

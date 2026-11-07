@@ -22,8 +22,25 @@ static_resources:
                 "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
                 stat_prefix: ingress_kserve_v2_custos
                 codec_type: AUTO
+                generate_request_id: true
                 stream_idle_timeout: 15s
                 request_timeout: 30s
+                access_log:
+                  - name: envoy.access_loggers.stdout
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.access_loggers.stream.v3.StdoutAccessLog
+                      log_format:
+                        json_format:
+                          timestamp: "%START_TIME%"
+                          request_id: "%REQ(X-REQUEST-ID)%"
+                          grpc_path: "%REQ(:PATH)%"
+                          authority: "%REQ(:AUTHORITY)%"
+                          http_status: "%RESPONSE_CODE%"
+                          grpc_status: "%GRPC_STATUS%"
+                          response_code_details: "%RESPONSE_CODE_DETAILS%"
+                          bytes_received: "%BYTES_RECEIVED%"
+                          duration_ms: "%DURATION%"
+                          upstream_host: "%UPSTREAM_HOST%"
                 http2_protocol_options:
                   max_concurrent_streams: 1024
                   initial_stream_window_size: 16777216
@@ -45,6 +62,10 @@ static_resources:
                             cluster: triton_upstream_cluster
                             timeout: 30s
                 http_filters:
+                  - name: envoy.filters.http.buffer
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.buffer.v3.Buffer
+                      max_request_bytes: 16777216
                   - name: envoy.filters.http.ext_proc
                     typed_config:
                       "@type": type.googleapis.com/envoy.extensions.filters.http.ext_proc.v3.ExternalProcessor

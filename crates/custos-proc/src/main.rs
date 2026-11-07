@@ -61,7 +61,7 @@ pub struct CliArgs {
     )]
     pub max_tags_scanned: usize,
 
-    /// Enforce byte-level parity between declared shape product and `raw_input_contents` (CVE-2025-23320).
+    /// Enforce per-input byte-level parity between declared shape/datatype and `raw_input_contents`.
     #[arg(
         long,
         env = "CUSTOS_ENFORCE_PAYLOAD_PARITY",

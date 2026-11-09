@@ -22,12 +22,9 @@
   <h3 align="center">Custos-Gateway</h3>
 
   <p align="center">
-    <em><strong>Custōs</strong> — Latin (<code>KUSS-tahss</code> or <code>KUSS-tohs</code>), meaning a <strong>keeper, guardian, protector, or custodian</strong>.</em>
+    Layer 7 admission control for KServe v2 gRPC traffic with Rust and Envoy <code>ext_proc</code>.
     <br />
-    <br />
-    High-Performance, Zero-Copy Layer 7 Admission Control for AI Inference Traffic Using Rust and Envoy <code>ext_proc</code>
-    <br />
-    <a href="#about-the-project"><strong>Explore the docs »</strong></a>
+    <a href="https://val-27.github.io/custos-web/"><strong>View Full Documentation &amp; Benchmarks (Custos-Web) »</strong></a>
     <br />
     <br />
     <a href="https://github.com/val-27/Custos-Bench">Benchmark Suite (Custos-Bench)</a>
@@ -49,9 +46,7 @@
     <li>
       <a href="#about-the-project">About The Project</a>
       <ul>
-        <li><a href="#problem-statement--architectural-rationale">Problem Statement & Architectural Rationale</a></li>
-        <li><a href="#core-technical-invariants-custos-core">Core Technical Invariants (<code>custos-core</code>)</a></li>
-        <li><a href="#scientific-evaluation--security-summary">Scientific Evaluation & Security Summary</a></li>
+        <li><a href="#data-path-topology">Data Path Topology</a></li>
         <li><a href="#repository-structure">Repository Structure</a></li>
         <li><a href="#built-with">Built With</a></li>
       </ul>
@@ -66,8 +61,9 @@
     <li>
       <a href="#usage">Usage</a>
       <ul>
-        <li><a href="#deployment--evaluation-architectures">Deployment & Evaluation Architectures</a></li>
-        <li><a href="#custos-proc-cli-reference"><code>custos-proc</code> CLI Reference</a></li>
+        <li><a href="#start-local-deployments">Start Local Deployments</a></li>
+        <li><a href="#start-kubernetes-deployments">Start Kubernetes Deployments</a></li>
+        <li><a href="#cli-parameters">CLI Parameters</a></li>
       </ul>
     </li>
     <li><a href="#roadmap">Roadmap</a></li>
@@ -84,95 +80,59 @@
 <!-- ABOUT THE PROJECT -->
 ## About The Project
 
+`Custos-Gateway` inspects KServe v2 gRPC inference requests before they reach the inference server.
+Envoy Proxy receives client HTTP/2 traffic and sends each request over a Unix Domain Socket (UDS) to `custos-proc`.
+`custos-proc` uses `custos-core` to check the binary Protocol Buffers (Protobuf) wire format with zero heap allocations.
+If a request is valid, `custos-proc` tells Envoy to forward the request to the backend.
+If a request violates a wire rule, `custos-proc` tells Envoy to reject the request immediately.
 
+For full architecture notes, security rules, and benchmark data, see [Custos-Web](https://val-27.github.io/custos-web/).
 
-```text
-                     ┌──────────────────────────────────────────────────────────┐
-                     │                Unprivileged Ingress Plane                │
-                     │                                                          │
-Downstream Client ───┼──► Envoy Proxy (:8001) ═══[ UDS: ext_proc.sock ]═══► custos-proc
-  (HTTP/2 / gRPC)    │     • Reassembles TCP               (0660)             (custos-core)
-                     │     • Demultiplexes HTTP/2                           • Zero-alloc TLV scan
-                     │     • Buffers ≤16 MiB body                           • ≤10B varint bound
-                     └───────────────┬──────────────────────────────────────────┬┘
-                                     │ ALLOW (Continue)                         │ DENY (ImmediateResponse)
-                                     ▼                                          ▼
-                          KServe v2 Backend (:9001)                  HTTP 400 / gRPC INVALID_ARGUMENT (3)
+### Data Path Topology
+
+```mermaid
+flowchart LR
+    Client["Downstream Client (HTTP/2 gRPC)"]
+
+    subgraph Ingress["Unprivileged Ingress Pod"]
+        direction LR
+        Envoy["Envoy Proxy (:8001)"]
+        Sidecar["custos-proc Sidecar (custos-core)"]
+        Envoy <-->|"UDS (/var/run/custos/ext_proc.sock)"| Sidecar
+    end
+
+    Backend["KServe v2 Backend (:9001)"]
+    Reject["Client Error (HTTP 400 / 403)"]
+
+    Client -->|"ModelInfer Request"| Envoy
+    Envoy -->|"ALLOW (Continue)"| Backend
+    Envoy -->|"DENY (ImmediateResponse)"| Reject
 ```
-
-### Problem Statement & Architectural Rationale
-
-Modern AI inference runtimes—such as **NVIDIA Triton Inference Server**—rely on high-throughput gRPC streams transporting binary Protocol Buffers (Protobuf) tensor payloads (`KServe v2` / `inference.GRPCInferenceService/ModelInfer`). Because model runtimes execute tight compute-bound operations on specialized GPU and CPU hardware, they assume well-formed wire inputs and are acutely vulnerable to resource-exhausting or structurally malformed payloads:
-
-* **Protobuf Nesting Bombs:** Deeply nested `Wire Type 2` length-delimited submessages that exhaust C++ recursive parser call stacks.
-* **Tensor Shape Overflows:** Anomalous dimension arrays (negative dimensions, 64-bit integer wraparounds, or multi-gigabyte dimension products) that trigger unhandled out-of-memory (OOM) heap allocations before tensor buffer bounds are checked.
-* **Malformed Varints:** Unterminated Base-128 varint sequences (`11+` continuation bytes with `MSB = 1` or 10th-byte 64-bit overflows) that stall wire parsers.
-
-#### Why Layer 7 `ext_proc` Instead of Layer 2/3 `AF_XDP` / `eBPF`?
-Custos pivoted from a kernel-bypass `AF_XDP` packet filter to an **unprivileged, zero-copy Layer 7 admission control daemon** written in Rust due to three physical systems boundaries verified during early prototyping:
-1. **Cryptographic Blindness (TLS 1.3 / mTLS):** Ephemeral per-connection keys render NIC-level packet rings opaque ciphertext; the Linux eBPF verifier prohibits the unbounded loops and dynamic allocations required to terminate TLS in-kernel.
-2. **Multi-Frame TCP Segmentation & HTTP/2 Multiplexing:** Inference tensors (`600 KB` to `9.6+ MB`) span hundreds of MTU frames that can arrive out of order and are multiplexed across stateful HTTP/2 streams using HPACK header compression. Inspecting application payloads at the packet ring requires re-implementing a full user-space TCP reassembly and HTTP/2 state machine.
-3. **Privilege & Blast-Radius Constraints:** `AF_XDP` requires `CAP_NET_ADMIN`, `CAP_BPF`, and host networking on GPU nodes, introducing security exposure and colliding with cluster CNIs (such as Cilium).
-
-### Core Technical Invariants (`custos-core`)
-
-`custos-core` is compiled with `#![no_std]` and `#![forbid(unsafe_code)]`. It validates contiguous byte slices (`&[u8]`) in a **single pass with zero heap allocations**:
-
-1. **gRPC Frame Header Verification:**
-   Validates that the leading byte has compression disabled (`0x00`) and that bytes `1..5` (big-endian `u32` declared length) match `slice.len() - 5`.
-2. **Bounded 10-Byte Varint Decoding (`varint.rs`):**
-   Unrolls Base-128 varint decoding up to a strict 10-byte ceiling. If byte index `9` (the 10th byte) has any bit above `0x01` set (which would overflow `u64::MAX`) or still carries a continuation bit (`0x80`), `ParseError::MalformedVarint` is raised immediately.
-3. **Iterative Stack-Allocated Nesting Tracker (`scanner.rs`):**
-   Tracks `Wire Type 2` submessage scopes using a fixed stack array `[ScopeFrame; MAX_DEPTH]` (`MAX_DEPTH = 16`). Any submessage exceeding depth `16` is rejected with `ParseError::NestingLimitExceeded(17)` without recursive function calls.
-4. **KServe v2 Context-Aware Schema Walker & $O(1)$ Bulk Skipping:**
-   Follows the KServe v2 `inference.ModelInferRequest` wire specification:
-   - **Root Fields `1` (`model_name`), `2` (`model_version`), `3` (`id`), and `7` (`raw_input_contents`):** Skipped in **$O(1)$ time** by advancing the slice cursor past their length-delimited boundaries. Multi-megabyte float32 tensor buffers in Field 7 are never parsed as Protobuf tags, preventing both latency linear scans and false positives.
-   - **Root Field `5` (`inputs` -> `InferInputTensor`):** Pushes an `MsgContext::InferInputTensor` frame onto the scope stack (up to `MAX_INPUT_TENSORS = 32` per request).
-   - **`InferInputTensor` Field `3` (`shape`):** Supports both **packed repeated `int64`** (`Wire Type 2`, tag `0x1A`) and **unpacked repeated `int64`** (`Wire Type 0`, tag `0x18`). Each dimension varint is counted toward `DEFAULT_MAX_TAGS_SCANNED`, validated (`dim > 0`, rejecting non-positive dimensions with `ParseError::NegativeDimension`), and multiplied into a per-tensor and cumulative request total via `i64::checked_mul` (catching 64-bit integer wraparounds with `ParseError::ShapeOverflow`). If any tensor or cumulative request total exceeds `DEFAULT_MAX_TENSOR_ELEMENTS` (`16,777,216` elements = `64 MiB` for `FP32`/`INT32`, `128 MiB` for `FP64`), `ParseError::BufferCeilingExceeded` is returned immediately.
-5. **1-to-1 Per-Input Shape-to-Buffer Parity & `InferTensorContents` Verification:**
-   Maps `InferInputTensor` Field `2` (`datatype`: `FP32`, `FP64`, `INT64`, `FP16`, `BF16`, `INT32`, `INT8`, `UINT8`, `BOOL`, `BYTES`, etc.) to its element byte width (rejecting missing or unknown datatypes) and enforces 1-to-1 positional parity between each input tensor `i` and either its corresponding `raw_input_contents[i]` chunk (Root Field `7`) or inline `InferTensorContents` (`Field 5` inside `InferInputTensor`). Swapped chunks, missing chunks, and element-count mismatches are rejected with `ParseError::PayloadSizeMismatch`. For variable-length `BYTES` tensors, `custos-core` walks the 4-byte little-endian `u32` length prefixes inside that input's `raw_input_contents[i]` chunk to verify that exactly $\prod \text{dim}_i$ length-prefixed strings fit within the chunk without over-read. *(Note: this enforces the KServe v2 wire invariant directly; NVIDIA's `CVE-2025-23320` and `CVE-2025-23334` advisories concern Triton Python-backend shared-memory region name disclosure on oversized payloads and subsequent shared-memory OOB read.)*
-6. **Shallow Unknown-Field & Packed-Tag Ceiling (`CVE-2022-1941` / `CVE-2021-22569`-Class):**
-   Bounds the total number of Protobuf TLV tags and packed dimension/element varints scanned per message to `DEFAULT_MAX_TAGS_SCANNED` (`1,024`), mitigating Protobuf parser resource-exhaustion bug classes (`CVE-2022-1941` in `protobuf-cpp` and `CVE-2021-22569` in `protobuf-java`).
-7. **KServe v2 Unary RPC Allowlisting & `ModelInfer` Shared-Memory Parameter Guard (`CVE-2024-0088`):**
-   At the `RequestHeaders` stage in `custos-proc`, only unary inference and read-only health/metadata RPCs (`ModelInfer`, `ServerLive`, `ServerReady`, `ModelReady`, `ModelMetadata`, `ModelConfig`) are admitted, and non-identity `grpc-encoding` headers (`gzip`, `deflate`) are rejected. Administrative and shared-memory RPCs (`SystemSharedMemoryRegister`, `CudaSharedMemoryRegister`, `RepositoryModelLoad`, `RepositoryModelUnload`) are rejected immediately with `HTTP 403 Forbidden` and `gRPC PERMISSION_DENIED (7)` (`custos_denied:unauthorized_rpc_method`). Furthermore, because `CVE-2024-0088` can be triggered on an allowlisted `ModelInfer` call by injecting `shared_memory_region`, `shared_memory_offset`, or `shared_memory_byte_size` inside `InferInputTensor.parameters`, `InferRequestedOutputTensor.parameters`, or `ModelInferRequest.parameters`, `custos-core` inspects parameter map keys on the wire and rejects `shared_memory_*` keys with `ParseError::UnauthorizedSharedMemoryParameter`.
-
-### Scientific Evaluation & Security Summary
-
-`Custos-Gateway` is evaluated using [**`Custos-Bench`**](https://github.com/val-27/Custos-Bench), a coordinated-omission-free open-loop gRPC load generator and deterministic binary Protobuf exploit synthesizer:
-
-| Threat Vector / CVE Class | Corpus Payloads (`Custos-Bench`) | `Custos-Gateway` Defense Invariant | Enforcement Stage & Action |
-| :--- | :--- | :--- | :--- |
-| **Shared-Memory Parameter Injection & Admin RPCs** (`CVE-2024-0088`) | `cve_2024_0088_shm_params_infer` (`shared_memory_*` on `ModelInfer`) + unit-tested `:path` guard | `:path` allowlisting + `ParameterMapEntry` `shared_memory_*` key rejection | `RequestHeaders` (`403`) & `RequestBody` (`400` / `INVALID_ARGUMENT`) |
-| **Recursive Submessage, `SGROUP` & Compressed Bombs** (`CVE-2024-7254`-class) | `nesting_depth_{17..500}`, `sgroup_wire_type_3_bomb`, `grpc_compressed_flag_01` | Fixed-stack depth tracker (`MAX_DEPTH = 16`), Wire Type 3/4 rejection & `flag == 0x00` enforcement | `RequestBody` $\rightarrow$ `HTTP 400` / `gRPC INVALID_ARGUMENT (3)` |
-| **Tensor Shape OOM & 64-Bit Wraparound** | `shape_neg_*`, `shape_wrap_64bit_*`, `shape_oom_massive_*`, `shape_reordered_tail` | `dim > 0`, `i64::checked_mul`, per-tensor & cumulative `DEFAULT_MAX_TENSOR_ELEMENTS` ceiling | `RequestBody` $\rightarrow$ `HTTP 400` / `gRPC INVALID_ARGUMENT (3)` |
-| **KServe v2 Per-Input Buffer Parity Mismatch** | `shape_buffer_mismatch_underread` (`2.41 MB` declared vs. `64 B` payload) | 1-to-1 per-input byte parity between $\prod \text{dim}_i \times \text{sizeof}(\text{dtype})$ and Field 7 / `InferTensorContents` | `RequestBody` $\rightarrow$ `HTTP 400` / `gRPC INVALID_ARGUMENT (3)` |
-| **Shallow Unknown-Field Tag Flood** (`CVE-2022-1941` / `CVE-2021-22569`-class) | `unknown_field_ast_flood` (`1,500` unknown tags at `D=0`) | Bounded TLV & packed-varint counter (`DEFAULT_MAX_TAGS_SCANNED = 1,024`) | `RequestBody` $\rightarrow$ `HTTP 400` / `gRPC INVALID_ARGUMENT (3)` |
-| **Malformed / Unterminated Varints** | `varint_unterminated_{11,64}`, `varint_10th_byte_overflow`, `varint_truncated_eof` | Unrolled 10-byte Base-128 decoder with 10th-byte overflow guard | `RequestBody` $\rightarrow$ `HTTP 400` / `gRPC INVALID_ARGUMENT (3)` |
-| **Benign ResNet-50 (`B=1..16`), `BYTES` & `D<=16`** | `benign_b1` (`602 KB`) $\rightarrow$ `benign_b16` (`9.63 MB`), `benign_bytes_tensor`, `nesting_depth_{15,16}` | $O(1)$ slice cursor jump over `raw_input_contents` & exact 4B `BYTES` prefix walk | `RequestBody` $\rightarrow$ `ALLOW (Continue)` (`0%` False Positive Rate) |
 
 ### Repository Structure
 
 ```text
 Custos-Gateway/
-├── Cargo.toml                         # Rust 2024 workspace (LTO="fat", panic="abort")
-├── Dockerfile                         # Multi-stage Debian Bookworm image (UID/GID 10001)
+├── Cargo.toml                         # Rust 2024 workspace
+├── Dockerfile                         # Multi-stage container build (UID/GID 10001)
 ├── images/
-│   └── CUSTOS.png                     # Project header banner
-├── proto/envoy/service/ext_proc/v3/   # Envoy ExternalProcessor v3 protobuf definitions
+│   └── CUSTOS.png                     # Project banner
+├── proto/envoy/service/ext_proc/v3/   # Envoy ExternalProcessor v3 proto files
 ├── crates/
-│   ├── custos-core/                   # #![no_std], #![forbid(unsafe_code)] zero-copy TLV wire scanner
+│   ├── custos-core/                   # Zero-copy Protobuf wire scanner (#![no_std])
 │   │   └── src/
-│   │       ├── lib.rs                 # Public API & comprehensive unit test suite
-│   │       ├── scanner.rs             # Single-pass TLV state machine & KServe v2 walker
-│   │       ├── varint.rs              # Bounded 10-byte Base-128 varint decoder
-│   │       └── error.rs               # Exhaustive ParseError taxonomy
-│   └── custos-proc/                   # Async Tokio/Tonic Envoy ext_proc daemon over UDS
+│   │       ├── lib.rs                 # Public API and unit tests
+│   │       ├── scanner.rs             # TLV state machine and KServe v2 checks
+│   │       ├── varint.rs              # 10-byte Base-128 varint decoder
+│   │       └── error.rs               # ParseError definitions
+│   └── custos-proc/                   # Envoy ext_proc daemon over UDS
 │       └── src/
-│           ├── main.rs                # CLI, UDS lifecycle (0660), signal handling, e2e UDS test
-│           └── service.rs             # ExternalProcessor stream handler & atomic ServiceMetrics
+│           ├── main.rs                # CLI, UDS setup, and integration tests
+│           ├── service.rs             # ExternalProcessor stream handler
+│           └── triton_sim.rs          # KServe v2 test backend
 └── deployments/
-    ├── bare-metal/                    # Scientific evaluation configs (Topology B & Topology C)
-    └── k8s-topology1-gateway-sidecar/ # Practical production Kubernetes deployment
+    ├── bare-metal/                    # Local Envoy and sidecar configurations
+    └── k8s-topology1-gateway-sidecar/ # Kubernetes manifests
 ```
 
 <p align="right">(<a href="#readme-top">back to top</a>)</p>
@@ -196,33 +156,33 @@ Custos-Gateway/
 <!-- GETTING STARTED -->
 ## Getting Started
 
-Follow these instructions to build, test, and run `Custos-Gateway` locally or inside a Kubernetes cluster.
+Use these steps to build and test `Custos-Gateway`.
 
 ### Prerequisites
 
-* **Rust Toolchain** (Edition 2024 / Rust 1.85+)
+* **Rust Toolchain** (Rust 1.85 or later, Edition 2024):
   ```sh
   curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
   ```
-* **Envoy Proxy** (v1.28+ with `ext_proc` filter support, for bare-metal runs)
-* **Docker & Kubernetes (`kubectl`)** (optional, for containerized and cluster deployments)
+* **Envoy Proxy** (v1.28 or later with `ext_proc` support) for local runs.
+* **Docker and `kubectl`** for container and Kubernetes runs.
 
 ### Installation
 
-1. Clone the repository
+1. Clone the repository:
    ```sh
    git clone https://github.com/val-27/Custos-Gateway.git
    cd Custos-Gateway
    ```
-2. Run all unit and end-to-end Unix Domain Socket (UDS) integration tests
+2. Run all unit and integration tests:
    ```sh
    cargo test --workspace
    ```
-3. Build the optimized release binary (`fat` LTO, single codegen unit, stripped)
+3. Build the release binary:
    ```sh
    cargo build --release -p custos-proc
    ```
-4. (Optional) Build the multi-stage container image
+4. Build the container image (optional):
    ```sh
    docker build -t custos-proc:latest .
    ```
@@ -234,25 +194,21 @@ Follow these instructions to build, test, and run `Custos-Gateway` locally or in
 <!-- USAGE EXAMPLES -->
 ## Usage
 
-### Deployment & Evaluation Architectures
+### Start Local Deployments
 
-Located in [`deployments/k8s-topology1-gateway-sidecar/`](./deployments/k8s-topology1-gateway-sidecar/README.md) (Kubernetes) and [`deployments/bare-metal/`](./deployments/bare-metal/README.md) (Bare-Metal). Paired with [**`Custos-Bench`**](https://github.com/val-27/Custos-Bench) to evaluate three unified architectures:
+Run the local helper script from the repository root:
 
-* **Unprotected Control (Direct Triton):** Client directly targets NVIDIA Triton Inference Server (`:8001`).
-* **Proxy Baseline (Envoy Only):** Client targets Envoy Proxy ([`envoy-baseline.yaml`](./deployments/bare-metal/envoy-baseline.yaml), `:8002`) forwarding to Triton without `ext_proc`.
-* **Custos Production (Gateway + Sidecar):** Client targets Envoy Proxy ([`envoy-custos.yaml`](./deployments/bare-metal/envoy-custos.yaml) / [`k8s-topology1-gateway-sidecar`](./deployments/k8s-topology1-gateway-sidecar/README.md), `:8003` / `:8001`) co-located with the `custos-proc` Native Sidecar enforcing fail-closed `ext_proc` admission over `/var/run/custos/ext_proc.sock`.
-
-#### A. Bare-Metal Execution
 ```sh
-# Start Topology C (Custos + Envoy) locally
+# Start Envoy with the custos-proc sidecar
 ./deployments/bare-metal/run-local.sh custos
 
-# Start Topology B (Envoy baseline) locally
+# Start Envoy without the sidecar (baseline)
 ./deployments/bare-metal/run-local.sh baseline
 ```
 
-#### B. Practical Production Deployment (Kubernetes Gateway Sidecar)
-Located in [`deployments/k8s-topology1-gateway-sidecar/`](./deployments/k8s-topology1-gateway-sidecar/README.md). Deploys Envoy Proxy and `custos-proc` (as a Kubernetes Native Sidecar sharing a RAM-backed `emptyDir` Unix socket volume) inside a dedicated, unprivileged Ingress Gateway Pod in front of the GPU-backed Triton Inference Server Service.
+### Start Kubernetes Deployments
+
+Apply the Kubernetes manifests in order:
 
 ```sh
 kubectl apply -f deployments/k8s-topology1-gateway-sidecar/deployment-triton-pod.yaml
@@ -261,22 +217,20 @@ kubectl apply -f deployments/k8s-topology1-gateway-sidecar/configmap-envoy.yaml
 kubectl apply -f deployments/k8s-topology1-gateway-sidecar/deployment-gateway-pod.yaml
 ```
 
-_For full load-generation instructions, exploit corpus synthesis, and automated multi-trial benchmarking across Topologies A, B, and C, see the [**Custos-Bench repository**](https://github.com/val-27/Custos-Bench)._
-
-### `custos-proc` CLI Reference
+### CLI Parameters
 
 | Flag | Environment Variable | Default | Description |
 | :--- | :--- | :--- | :--- |
-| `--socket-path` | `CUSTOS_SOCKET_PATH` | `/var/run/custos/ext_proc.sock` | Unix Domain Socket path bound with `0660` permissions |
-| `--max-nesting-depth` | `CUSTOS_MAX_NESTING_DEPTH` | `16` | Maximum allowed Protobuf submessage depth (`1..=16`) |
-| `--max-tensor-elements` | `CUSTOS_MAX_TENSOR_ELEMENTS` | `16777216` | Maximum shape element product per `InferInputTensor` |
-| `--max-tags-scanned` | `CUSTOS_MAX_TAGS_SCANNED` | `1024` | Maximum Protobuf TLV tags and packed varints scanned per message (`CVE-2022-1941` / `CVE-2021-22569`-class) |
-| `--enforce-payload-parity` | `CUSTOS_ENFORCE_PAYLOAD_PARITY` | `true` | Enforce 1-to-1 per-input byte parity between declared tensor shape and `raw_input_contents` / `InferTensorContents` |
-| `--max-message-size-mb` | `CUSTOS_MAX_MESSAGE_SIZE_MB` | `32` | Maximum gRPC message size accepted from Envoy in MiB |
-| `--log-format` | `CUSTOS_LOG_FORMAT` | `json` | Structured log output format (`json`, `compact`, `pretty`) |
-| `--log-level` | `CUSTOS_LOG_LEVEL` | `info` | Tracing filter directive when `RUST_LOG` is unset |
-| `--log-admitted` | `CUSTOS_LOG_ADMITTED` | `true` | Emit per-request `INFO` logs on `ALLOW` (set `false` during high-RPS benchmarks) |
-| `--stats-interval-secs` | `CUSTOS_STATS_INTERVAL_SECS` | `60` | Periodic cumulative telemetry heartbeat interval in seconds (`0` to disable) |
+| `--socket-path` | `CUSTOS_SOCKET_PATH` | `/var/run/custos/ext_proc.sock` | Set the UDS file path (`0660` permissions). |
+| `--max-nesting-depth` | `CUSTOS_MAX_NESTING_DEPTH` | `16` | Set the maximum Protobuf submessage depth (`1..=16`). |
+| `--max-tensor-elements` | `CUSTOS_MAX_TENSOR_ELEMENTS` | `16777216` | Set the maximum element count per tensor. |
+| `--max-tags-scanned` | `CUSTOS_MAX_TAGS_SCANNED` | `1024` | Set the maximum number of scanned tags per message. |
+| `--enforce-payload-parity` | `CUSTOS_ENFORCE_PAYLOAD_PARITY` | `true` | Require tensor byte size to match declared shape. |
+| `--max-message-size-mb` | `CUSTOS_MAX_MESSAGE_SIZE_MB` | `32` | Set the maximum gRPC message size in MiB. |
+| `--log-format` | `CUSTOS_LOG_FORMAT` | `json` | Set the log format (`json`, `compact`, `pretty`). |
+| `--log-level` | `CUSTOS_LOG_LEVEL` | `info` | Set the log level when `RUST_LOG` is not set. |
+| `--log-admitted` | `CUSTOS_LOG_ADMITTED` | `true` | Write an `INFO` log for each allowed request. |
+| `--stats-interval-secs` | `CUSTOS_STATS_INTERVAL_SECS` | `60` | Set the metrics log interval in seconds (`0` disables). |
 
 <p align="right">(<a href="#readme-top">back to top</a>)</p>
 
@@ -285,17 +239,17 @@ _For full load-generation instructions, exploit corpus synthesis, and automated 
 <!-- ROADMAP -->
 ## Roadmap
 
-- [x] Zero-copy `#![no_std]` TLV wire scanner (`custos-core`) with `#![forbid(unsafe_code)]`
-- [x] Bounded 10-byte varint decoding and stack-allocated nesting depth tracker (`MAX_DEPTH = 16`)
-- [x] KServe v2 `ModelInferRequest` context-aware walker with $O(1)$ tensor buffer skipping
-- [x] 1-to-1 per-input shape-to-payload byte parity verification & unknown-field flood ceiling (`CVE-2022-1941` / `CVE-2021-22569`-class)
-- [x] KServe v2 unary RPC method allowlisting at `RequestHeaders` stage & `ModelInfer` shared-memory parameter rejection (`CVE-2024-0088`)
-- [x] Bare-metal and Kubernetes Native Sidecar (`ext_proc` over UDS) deployment topologies
-- [ ] Prometheus / OpenTelemetry metrics exporter endpoint for real-time rejection telemetry
-- [ ] Dynamic per-model tensor shape and datatype policy profiles
-- [ ] Support for additional inference wire protocols (e.g., TorchServe, vLLM OpenAI-compatible gRPC)
+- [x] Zero-copy `#![no_std]` Protobuf wire scanner (`custos-core`) with `#![forbid(unsafe_code)]`
+- [x] 10-byte varint limit and fixed-stack depth tracker (`MAX_DEPTH = 16`)
+- [x] KServe v2 `ModelInferRequest` checks with $O(1)$ tensor buffer skips
+- [x] Per-input tensor shape and buffer size matching
+- [x] KServe v2 RPC path allowlist and `shared_memory_*` parameter rejection
+- [x] Bare-metal and Kubernetes Native Sidecar deployments
+- [ ] Prometheus metrics endpoint
+- [ ] Per-model tensor shape policy files
+- [ ] Support for additional gRPC inference protocols
 
-See the [open issues](https://github.com/val-27/Custos-Gateway/issues) for a full list of proposed features (and known issues).
+See the [open issues](https://github.com/val-27/Custos-Gateway/issues) for all proposed features and known issues.
 
 <p align="right">(<a href="#readme-top">back to top</a>)</p>
 
@@ -304,16 +258,13 @@ See the [open issues](https://github.com/val-27/Custos-Gateway/issues) for a ful
 <!-- CONTRIBUTING -->
 ## Contributing
 
-Contributions are what make the open source community such an amazing place to learn, inspire, and create. Any contributions you make are **greatly appreciated**.
+Use these steps to submit a change:
 
-If you have a suggestion that would make this better, please fork the repo and create a pull request. You can also simply open an issue with the tag "enhancement".
-Don't forget to give the project a star! Thanks again!
-
-1. Fork the Project
-2. Create your Feature Branch (`git checkout -b feature/AmazingFeature`)
-3. Commit your Changes (`git commit -m 'Add some AmazingFeature'`)
-4. Push to the Branch (`git push origin feature/AmazingFeature`)
-5. Open a Pull Request
+1. Fork the repository.
+2. Create a feature branch (`git checkout -b feature/NewFeature`).
+3. Commit your changes (`git commit -m 'Add NewFeature'`).
+4. Push the branch (`git push origin feature/NewFeature`).
+5. Open a pull request.
 
 ### Top contributors:
 
@@ -328,7 +279,7 @@ Don't forget to give the project a star! Thanks again!
 <!-- LICENSE -->
 ## License
 
-Distributed under the Apache License, Version 2.0. See [`LICENSE`](./LICENSE) for more information.
+Distributed under the Apache License, Version 2.0. See [`LICENSE`](./LICENSE) for details.
 
 <p align="right">(<a href="#readme-top">back to top</a>)</p>
 
@@ -337,12 +288,12 @@ Distributed under the Apache License, Version 2.0. See [`LICENSE`](./LICENSE) fo
 <!-- CITATION -->
 ## Citation
 
-If you use `Custos-Gateway` or [`Custos-Bench`](https://github.com/val-27/Custos-Bench) in your research or security evaluations, please cite:
+Use this BibTeX entry to cite `Custos-Gateway`:
 
 ```bibtex
 @software{valentine2026custos,
   author       = {Valentine, JP},
-  title        = {{Custos-Gateway: High-Performance, Zero-Copy Layer 7 Admission Control for AI Inference Traffic Using Rust and Envoy ext\_proc}},
+  title        = {{Custos-Gateway: Layer 7 Admission Control for AI Inference Traffic Using Rust and Envoy ext\_proc}},
   year         = {2026},
   url          = {https://github.com/val-27/Custos-Gateway},
   license      = {Apache-2.0}
@@ -358,6 +309,7 @@ If you use `Custos-Gateway` or [`Custos-Bench`](https://github.com/val-27/Custos
 
 JP Valentine - [@val-27](https://github.com/val-27)
 
+* **Documentation & Benchmarks (Custos-Web):** [https://val-27.github.io/custos-web/](https://val-27.github.io/custos-web/)
 * **Gateway Repository:** [https://github.com/val-27/Custos-Gateway](https://github.com/val-27/Custos-Gateway)
 * **Benchmark Suite Repository:** [https://github.com/val-27/Custos-Bench](https://github.com/val-27/Custos-Bench)
 
@@ -368,11 +320,11 @@ JP Valentine - [@val-27](https://github.com/val-27)
 <!-- ACKNOWLEDGMENTS -->
 ## Acknowledgments
 
-* [Custos-Bench — Scientific Evaluation & Open-Loop Load Generation Suite](https://github.com/val-27/Custos-Bench)
+* [Custos-Bench](https://github.com/val-27/Custos-Bench)
 * [Envoy Proxy External Processing (`ext_proc`)](https://www.envoyproxy.io/docs/envoy/latest/configuration/http/http_filters/ext_proc_filter)
 * [KServe v2 Inference Protocol Specification](https://kserve.github.io/website/latest/modelserving/data_plane/v2_protocol/)
 * [NVIDIA Triton Inference Server](https://github.com/triton-inference-server/server)
-* [Tokio & Tonic Async Rust Ecosystem](https://github.com/hyperium/tonic)
+* [Tokio & Tonic](https://github.com/hyperium/tonic)
 * [Best-README-Template](https://github.com/othneildrew/Best-README-Template)
 
 <p align="right">(<a href="#readme-top">back to top</a>)</p>

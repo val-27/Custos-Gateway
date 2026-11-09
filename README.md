@@ -22,6 +22,9 @@
   <h3 align="center">Custos-Gateway</h3>
 
   <p align="center">
+    <em><strong>Custōs</strong> — Latin (<code>KUSS-tahss</code> or <code>KUSS-tohs</code>), meaning a <strong>keeper, guardian, protector, or custodian</strong>.</em>
+    <br />
+    <br />
     Layer 7 admission control for KServe v2 gRPC traffic with Rust and Envoy <code>ext_proc</code>.
     <br />
     <a href="https://val-27.github.io/custos-web/"><strong>View Full Documentation &amp; Benchmarks (Custos-Web) »</strong></a>

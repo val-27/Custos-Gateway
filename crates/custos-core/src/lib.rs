@@ -10,7 +10,7 @@ pub use scanner::{
     DEFAULT_MAX_TAGS_SCANNED, DEFAULT_MAX_TENSOR_ELEMENTS, MAX_DEPTH, MAX_INPUT_TENSORS,
     MsgContext, ScanFailure, ScanReport, ScannerConfig, ScopeFrame, inspect_grpc_frame,
     inspect_payload, inspect_payload_with_report, inspect_raw_protobuf,
-    inspect_raw_protobuf_with_report, kserve_datatype_byte_width,
+    inspect_raw_protobuf_with_report, kserve_datatype_byte_width, kserve_datatype_contents_field,
 };
 pub use varint::decode_varint;
 
@@ -621,5 +621,736 @@ mod tests {
 
         // 4. Empty ModelInfer protobuf inside a valid 5-byte gRPC frame (00 00 00 00 00) -> Ok(())
         assert_eq!(inspect_payload(&wrap_grpc_frame(&[]), &config), Ok(()));
+    }
+
+    /// Reference Protobuf wire model for `ModelInferRequest` following standard C++ `libprotobuf` /
+    /// `prost` deserialization rules:
+    /// - Arbitrary field ordering at both `ModelInferRequest` and `InferInputTensor` scopes
+    /// - Repeated `shape` concatenation across unpacked (`0x18`) and packed (`0x1A`) records
+    /// - Last-write-wins for scalar `name` and `datatype` fields
+    /// - Submessage merging when `InferInputTensor.contents` (Field 5) appears multiple times
+    /// - Per-datatype `InferTensorContents` field selection (ignoring or rejecting mismatched fields)
+    #[derive(Debug, Default, Clone)]
+    struct ReferenceInputTensor {
+        datatype: Vec<u8>,
+        shape: Vec<i64>,
+        has_contents_submsg: bool,
+        contents_by_field: [usize; 9],
+    }
+
+    #[derive(Debug, Default, Clone)]
+    struct ReferenceModelInfer {
+        inputs: Vec<ReferenceInputTensor>,
+        raw_chunks: Vec<Vec<u8>>,
+        has_shm_param: bool,
+    }
+
+    fn reference_parse_model_infer(
+        slice: &[u8],
+        max_depth: usize,
+        max_tags: usize,
+    ) -> Result<ReferenceModelInfer, ()> {
+        #[allow(clippy::too_many_arguments)]
+        fn parse_submsg(
+            slice: &[u8],
+            ctx: MsgContext,
+            depth: usize,
+            max_depth: usize,
+            tags: &mut usize,
+            max_tags: usize,
+            model: &mut ReferenceModelInfer,
+            cur_input: Option<&mut ReferenceInputTensor>,
+        ) -> Result<(), ()> {
+            let mut cursor = 0usize;
+            let mut cur_input = cur_input;
+            while cursor < slice.len() {
+                let tag = decode_varint(slice, &mut cursor).map_err(|_| ())?;
+                let wt = (tag & 0x07) as u8;
+                let field = tag >> 3;
+                if field == 0 {
+                    return Err(());
+                }
+                *tags = tags.saturating_add(1);
+                if max_tags > 0 && *tags > max_tags {
+                    return Err(());
+                }
+                match wt {
+                    0 => {
+                        let val = decode_varint(slice, &mut cursor).map_err(|_| ())?;
+                        match (ctx, field) {
+                            (MsgContext::InputTensor, 1 | 2 | 4 | 5)
+                            | (MsgContext::OutputTensor, 1 | 2)
+                            | (MsgContext::TensorContents, 6..=8) => return Err(()),
+                            (MsgContext::InputTensor, 3) => {
+                                if let Some(inp) = cur_input.as_deref_mut() {
+                                    inp.shape.push(val as i64);
+                                }
+                            }
+                            (MsgContext::TensorContents, 1..=5) => {
+                                if let Some(inp) = cur_input.as_deref_mut() {
+                                    inp.contents_by_field[field as usize] += 1;
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    1 => {
+                        let next = cursor.checked_add(8).ok_or(())?;
+                        if next > slice.len() {
+                            return Err(());
+                        }
+                        match (ctx, field) {
+                            (MsgContext::InputTensor, 1..=5)
+                            | (MsgContext::OutputTensor, 1 | 2)
+                            | (MsgContext::TensorContents, 1..=6 | 8) => return Err(()),
+                            (MsgContext::TensorContents, 7) => {
+                                if let Some(inp) = cur_input.as_deref_mut() {
+                                    inp.contents_by_field[7] += 1;
+                                }
+                            }
+                            _ => {}
+                        }
+                        cursor = next;
+                    }
+                    2 => {
+                        let len_u64 = decode_varint(slice, &mut cursor).map_err(|_| ())?;
+                        let len = usize::try_from(len_u64).map_err(|_| ())?;
+                        let end = cursor.checked_add(len).ok_or(())?;
+                        if end > slice.len() {
+                            return Err(());
+                        }
+                        let sub = &slice[cursor..end];
+                        cursor = end;
+                        match (ctx, field) {
+                            (MsgContext::Root, 1..=3)
+                            | (MsgContext::OutputTensor, 1)
+                            | (MsgContext::InputTensor, 1) => {}
+                            (MsgContext::Root, 7) => {
+                                if model.raw_chunks.len() >= MAX_INPUT_TENSORS {
+                                    return Err(());
+                                }
+                                model.raw_chunks.push(sub.to_vec());
+                            }
+                            (MsgContext::Root, 5) => {
+                                if depth + 1 > max_depth || model.inputs.len() >= MAX_INPUT_TENSORS
+                                {
+                                    return Err(());
+                                }
+                                let mut inp = ReferenceInputTensor::default();
+                                parse_submsg(
+                                    sub,
+                                    MsgContext::InputTensor,
+                                    depth + 1,
+                                    max_depth,
+                                    tags,
+                                    max_tags,
+                                    model,
+                                    Some(&mut inp),
+                                )?;
+                                model.inputs.push(inp);
+                            }
+                            (MsgContext::Root, 6) => {
+                                if depth + 1 > max_depth {
+                                    return Err(());
+                                }
+                                parse_submsg(
+                                    sub,
+                                    MsgContext::OutputTensor,
+                                    depth + 1,
+                                    max_depth,
+                                    tags,
+                                    max_tags,
+                                    model,
+                                    None,
+                                )?;
+                            }
+                            (MsgContext::Root, 4)
+                            | (MsgContext::InputTensor, 4)
+                            | (MsgContext::OutputTensor, 2) => {
+                                if depth + 1 > max_depth {
+                                    return Err(());
+                                }
+                                parse_submsg(
+                                    sub,
+                                    MsgContext::ParameterMapEntry,
+                                    depth + 1,
+                                    max_depth,
+                                    tags,
+                                    max_tags,
+                                    model,
+                                    None,
+                                )?;
+                            }
+                            (MsgContext::ParameterMapEntry, 1) => {
+                                if sub.starts_with(b"shared_memory") {
+                                    model.has_shm_param = true;
+                                    return Err(());
+                                }
+                            }
+                            (MsgContext::InputTensor, 2) => {
+                                if let Some(inp) = cur_input.as_deref_mut() {
+                                    // Protobuf scalar string: last-write-wins!
+                                    inp.datatype = sub.to_vec();
+                                }
+                            }
+                            (MsgContext::InputTensor, 3) => {
+                                let mut pcur = 0usize;
+                                while pcur < sub.len() {
+                                    *tags = tags.saturating_add(1);
+                                    if max_tags > 0 && *tags > max_tags {
+                                        return Err(());
+                                    }
+                                    let d = decode_varint(sub, &mut pcur).map_err(|_| ())?;
+                                    if let Some(inp) = cur_input.as_deref_mut() {
+                                        inp.shape.push(d as i64);
+                                    }
+                                }
+                            }
+                            (MsgContext::InputTensor, 5) => {
+                                if depth + 1 > max_depth {
+                                    return Err(());
+                                }
+                                if let Some(inp) = cur_input.as_deref_mut() {
+                                    inp.has_contents_submsg = true;
+                                    parse_submsg(
+                                        sub,
+                                        MsgContext::TensorContents,
+                                        depth + 1,
+                                        max_depth,
+                                        tags,
+                                        max_tags,
+                                        model,
+                                        Some(inp),
+                                    )?;
+                                }
+                            }
+                            (MsgContext::TensorContents, 1..=5) => {
+                                let mut pcur = 0usize;
+                                while pcur < sub.len() {
+                                    *tags = tags.saturating_add(1);
+                                    if max_tags > 0 && *tags > max_tags {
+                                        return Err(());
+                                    }
+                                    decode_varint(sub, &mut pcur).map_err(|_| ())?;
+                                    if let Some(inp) = cur_input.as_deref_mut() {
+                                        inp.contents_by_field[field as usize] += 1;
+                                    }
+                                }
+                            }
+                            (MsgContext::TensorContents, 6) => {
+                                if !sub.len().is_multiple_of(4) {
+                                    return Err(());
+                                }
+                                if let Some(inp) = cur_input.as_deref_mut() {
+                                    inp.contents_by_field[6] += sub.len() / 4;
+                                }
+                            }
+                            (MsgContext::TensorContents, 7) => {
+                                if !sub.len().is_multiple_of(8) {
+                                    return Err(());
+                                }
+                                if let Some(inp) = cur_input.as_deref_mut() {
+                                    inp.contents_by_field[7] += sub.len() / 8;
+                                }
+                            }
+                            (MsgContext::TensorContents, 8) => {
+                                if let Some(inp) = cur_input.as_deref_mut() {
+                                    inp.contents_by_field[8] += 1;
+                                }
+                            }
+                            _ => {
+                                if depth + 1 > max_depth {
+                                    return Err(());
+                                }
+                                parse_submsg(
+                                    sub,
+                                    MsgContext::GenericSubmsg,
+                                    depth + 1,
+                                    max_depth,
+                                    tags,
+                                    max_tags,
+                                    model,
+                                    None,
+                                )?;
+                            }
+                        }
+                    }
+                    5 => {
+                        let next = cursor.checked_add(4).ok_or(())?;
+                        if next > slice.len() {
+                            return Err(());
+                        }
+                        match (ctx, field) {
+                            (MsgContext::InputTensor, 1..=5)
+                            | (MsgContext::OutputTensor, 1 | 2)
+                            | (MsgContext::TensorContents, 1..=5 | 7 | 8) => return Err(()),
+                            (MsgContext::TensorContents, 6) => {
+                                if let Some(inp) = cur_input.as_deref_mut() {
+                                    inp.contents_by_field[6] += 1;
+                                }
+                            }
+                            _ => {}
+                        }
+                        cursor = next;
+                    }
+                    _ => return Err(()),
+                }
+            }
+            Ok(())
+        }
+
+        let mut model = ReferenceModelInfer::default();
+        let mut tags = 0usize;
+        parse_submsg(
+            slice,
+            MsgContext::Root,
+            0,
+            max_depth,
+            &mut tags,
+            max_tags,
+            &mut model,
+            None,
+        )?;
+        Ok(model)
+    }
+
+    fn reference_validate_model_infer(slice: &[u8], config: &ScannerConfig) -> bool {
+        let Ok(model) =
+            reference_parse_model_infer(slice, config.max_nesting_depth, config.max_tags_scanned)
+        else {
+            return false;
+        };
+        if model.has_shm_param {
+            return false;
+        }
+        let mut total_elems: i64 = 0;
+        let mut shape_products = Vec::with_capacity(model.inputs.len());
+        for inp in &model.inputs {
+            if !inp.shape.is_empty() {
+                let mut prod: i64 = 1;
+                for &d in &inp.shape {
+                    if d < 0 {
+                        return false;
+                    }
+                    let Some(next) = prod.checked_mul(d) else {
+                        return false;
+                    };
+                    if next > config.max_tensor_elements {
+                        return false;
+                    }
+                    prod = next;
+                }
+                total_elems = total_elems.saturating_add(prod);
+                if total_elems > config.max_tensor_elements {
+                    return false;
+                }
+                shape_products.push(prod);
+            } else {
+                shape_products.push(1);
+            }
+        }
+        if config.enforce_payload_parity && (!model.inputs.is_empty() || !model.raw_chunks.is_empty())
+        {
+            if model.inputs.is_empty() && !model.raw_chunks.is_empty() {
+                return false;
+            }
+            let any_inline = model.inputs.iter().any(|i| i.has_contents_submsg);
+            if any_inline && !model.raw_chunks.is_empty() {
+                return false;
+            }
+            if !any_inline && model.raw_chunks.len() != model.inputs.len() {
+                return false;
+            }
+            for (i, inp) in model.inputs.iter().enumerate() {
+                let width = kserve_datatype_byte_width(&inp.datatype);
+                let is_bytes = inp.datatype.as_slice() == b"BYTES";
+                if inp.shape.is_empty() || inp.datatype.is_empty() || (width.is_none() && !is_bytes)
+                {
+                    return false;
+                }
+                let expected_elems = usize::try_from(shape_products[i]).unwrap_or(usize::MAX);
+                if any_inline {
+                    let Some(exp_field) = kserve_datatype_contents_field(&inp.datatype) else {
+                        return false;
+                    };
+                    let has_foreign = (1usize..=8)
+                        .any(|f| f != exp_field as usize && inp.contents_by_field[f] > 0);
+                    if !inp.has_contents_submsg
+                        || has_foreign
+                        || inp.contents_by_field[exp_field as usize] != expected_elems
+                    {
+                        return false;
+                    }
+                } else if let Some(w) = width {
+                    let expected_bytes = shape_products[i]
+                        .checked_mul(w)
+                        .and_then(|b| usize::try_from(b).ok())
+                        .unwrap_or(usize::MAX);
+                    if model.raw_chunks[i].len() != expected_bytes {
+                        return false;
+                    }
+                } else if is_bytes {
+                    let chunk = &model.raw_chunks[i];
+                    if chunk.len() < expected_elems.saturating_mul(4) {
+                        return false;
+                    }
+                    let mut pos = 0usize;
+                    for _ in 0..expected_elems {
+                        let Some(len_end) = pos.checked_add(4) else {
+                            return false;
+                        };
+                        if len_end > chunk.len() {
+                            return false;
+                        }
+                        let l = u32::from_le_bytes([
+                            chunk[pos],
+                            chunk[pos + 1],
+                            chunk[pos + 2],
+                            chunk[pos + 3],
+                        ]) as usize;
+                        let Some(next) = len_end.checked_add(l) else {
+                            return false;
+                        };
+                        if next > chunk.len() {
+                            return false;
+                        }
+                        pos = next;
+                    }
+                    if pos != chunk.len() {
+                        return false;
+                    }
+                }
+            }
+        }
+        true
+    }
+
+    #[test]
+    fn test_protobuf_parser_differential_edge_cases() {
+        let config = ScannerConfig::default();
+
+        // 1. Split `shape` across multiple records (unpacked 0x18 + packed 0x1A + unpacked 0x18):
+        //    shape = [2] ++ [3, 2] ++ [1] = 12 FP32 elements (48 bytes).
+        let mut tensor_split_shape = Vec::new();
+        tensor_split_shape.extend_from_slice(b"\x0a\x03IN0\x12\x04FP32");
+        tensor_split_shape.extend_from_slice(b"\x18\x02"); // unpacked dim = 2
+        tensor_split_shape.extend_from_slice(b"\x1a\x02\x03\x02"); // packed dims = [3, 2]
+        tensor_split_shape.extend_from_slice(b"\x18\x01"); // unpacked dim = 1
+        let mut msg_split = Vec::new();
+        msg_split.extend_from_slice(b"\x0a\x08resnet50");
+        msg_split.push(0x2A);
+        push_varint(&mut msg_split, tensor_split_shape.len() as u64);
+        msg_split.extend_from_slice(&tensor_split_shape);
+        msg_split.push(0x3A);
+        push_varint(&mut msg_split, 48);
+        msg_split.extend_from_slice(&[0u8; 48]);
+        assert_eq!(inspect_raw_protobuf(&msg_split, &config), Ok(()));
+        assert!(reference_validate_model_infer(&msg_split, &config));
+
+        // 2. Duplicate scalar `datatype` field (last-write-wins):
+        //    First declares "FP32" (4 B/elem), then overwrites with "FP64" (8 B/elem) on shape [4].
+        //    A 16-byte raw chunk (matching the first "FP32") MUST be rejected because Triton uses "FP64" (32 B).
+        let mut tensor_dup_dt = Vec::new();
+        tensor_dup_dt.extend_from_slice(b"\x0a\x03IN0\x12\x04FP32\x1a\x01\x04\x12\x04FP64");
+        let mut msg_dup_bad = Vec::new();
+        msg_dup_bad.extend_from_slice(b"\x0a\x08resnet50\x2a");
+        push_varint(&mut msg_dup_bad, tensor_dup_dt.len() as u64);
+        msg_dup_bad.extend_from_slice(&tensor_dup_dt);
+        msg_dup_bad.extend_from_slice(b"\x3a\x10");
+        msg_dup_bad.extend_from_slice(&[0u8; 16]);
+        assert_eq!(
+            inspect_raw_protobuf(&msg_dup_bad, &config),
+            Err(ParseError::PayloadSizeMismatch {
+                expected_bytes: 32,
+                actual_bytes: 16,
+            })
+        );
+        assert!(!reference_validate_model_infer(&msg_dup_bad, &config));
+
+        //    Conversely, a 32-byte raw chunk (matching the final "FP64") MUST be allowed by both.
+        let mut msg_dup_ok = Vec::new();
+        msg_dup_ok.extend_from_slice(b"\x0a\x08resnet50\x2a");
+        push_varint(&mut msg_dup_ok, tensor_dup_dt.len() as u64);
+        msg_dup_ok.extend_from_slice(&tensor_dup_dt);
+        msg_dup_ok.extend_from_slice(b"\x3a\x20");
+        msg_dup_ok.extend_from_slice(&[0u8; 32]);
+        assert_eq!(inspect_raw_protobuf(&msg_dup_ok, &config), Ok(()));
+        assert!(reference_validate_model_infer(&msg_dup_ok, &config));
+
+        // 3. Cross-field `InferTensorContents` smuggling:
+        //    Declares datatype "FP32" with shape [4], but supplies 2 `fp32_contents` (Field 6) +
+        //    2 `int32_contents` (Field 2). Triton only reads `fp32_contents` (2 < 4) -> REJECT!
+        let mut bad_contents = Vec::new();
+        bad_contents.extend_from_slice(b"\x32\x08\x00\x00\x80\x3f\x00\x00\x00\x40"); // 2 packed fp32
+        bad_contents.extend_from_slice(b"\x10\x01\x10\x02"); // 2 unpacked int32 (Field 2)
+        let mut tensor_cross_contents = Vec::new();
+        tensor_cross_contents.extend_from_slice(b"\x0a\x03IN0\x12\x04FP32\x1a\x01\x04\x2a");
+        push_varint(&mut tensor_cross_contents, bad_contents.len() as u64);
+        tensor_cross_contents.extend_from_slice(&bad_contents);
+        let mut msg_cross = Vec::new();
+        msg_cross.extend_from_slice(b"\x0a\x08resnet50\x2a");
+        push_varint(&mut msg_cross, tensor_cross_contents.len() as u64);
+        msg_cross.extend_from_slice(&tensor_cross_contents);
+        assert_eq!(
+            inspect_raw_protobuf(&msg_cross, &config),
+            Err(ParseError::PayloadSizeMismatch {
+                expected_bytes: 16,
+                actual_bytes: 8,
+            })
+        );
+        assert!(!reference_validate_model_infer(&msg_cross, &config));
+
+        // 4. Split `InferTensorContents` submessages (Field 5 appearing twice on the same InputTensor):
+        //    Protobuf merges multiple occurrences of a singular message field, concatenating repeated
+        //    `fp32_contents` (2 floats + 2 floats == 4 floats for shape [4]). Both parsers must agree!
+        let mut half_contents = Vec::new();
+        half_contents.extend_from_slice(b"\x32\x08\x00\x00\x80\x3f\x00\x00\x00\x40"); // 2 packed fp32
+        let mut tensor_merged_contents = Vec::new();
+        tensor_merged_contents.extend_from_slice(b"\x0a\x03IN0\x12\x04FP32\x1a\x01\x04");
+        for _ in 0..2 {
+            tensor_merged_contents.push(0x2A);
+            push_varint(&mut tensor_merged_contents, half_contents.len() as u64);
+            tensor_merged_contents.extend_from_slice(&half_contents);
+        }
+        let mut msg_merged = Vec::new();
+        msg_merged.extend_from_slice(b"\x0a\x08resnet50\x2a");
+        push_varint(&mut msg_merged, tensor_merged_contents.len() as u64);
+        msg_merged.extend_from_slice(&tensor_merged_contents);
+        assert_eq!(inspect_raw_protobuf(&msg_merged, &config), Ok(()));
+        assert!(reference_validate_model_infer(&msg_merged, &config));
+
+        // 5. Mismatched wire type on `InferInputTensor` Field 2 (`datatype` sent as Wire Type 0 varint):
+        let bad_wt_dt = b"\x0a\x08resnet50\x2a\x07\x0a\x01x\x10\x01\x18\x01\x3a\x04\x00\x00\x00\x00";
+        assert_eq!(
+            inspect_raw_protobuf(bad_wt_dt, &config),
+            Err(ParseError::InvalidWireType(0))
+        );
+        assert!(!reference_validate_model_infer(bad_wt_dt, &config));
+    }
+
+    #[test]
+    fn test_differential_fuzz_custos_vs_reference_protobuf_parser() {
+        let config = ScannerConfig::default();
+        // Deterministic SplitMix64 PRNG for reproducible fuzzing across 5,000 structured and
+        // mutated KServe v2 `ModelInferRequest` wire streams.
+        let mut state: u64 = 0xC057_05F0_226E_76E1;
+        let mut next_u64 = || -> u64 {
+            state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = state;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^ (z >> 31)
+        };
+
+        let datatypes: &[&[u8]] = &[
+            b"BOOL", b"INT8", b"UINT8", b"INT16", b"UINT16", b"FP16", b"BF16", b"INT32",
+            b"UINT32", b"FP32", b"INT64", b"UINT64", b"FP64", b"BYTES", b"FP32 ", b"UNKNOWN",
+        ];
+
+        let mut allowed_count = 0usize;
+        let mut rejected_count = 0usize;
+
+        for iter in 0..5_000 {
+            let mut msg = Vec::new();
+            let num_inputs = (next_u64() % 4) as usize;
+            let use_inline = (next_u64() % 3) == 0;
+            let raws_first = (next_u64() % 2) == 0;
+
+            let mut input_blobs = Vec::new();
+            let mut raw_blobs = Vec::new();
+
+            for _ in 0..num_inputs {
+                let dt1 = datatypes[(next_u64() as usize) % datatypes.len()];
+                let has_second_dt = (next_u64() % 4) == 0;
+                let dt2 = datatypes[(next_u64() as usize) % datatypes.len()];
+                let final_dt = if has_second_dt { dt2 } else { dt1 };
+
+                let dim_count = ((next_u64() % 4) + 1) as usize;
+                let mut dims = Vec::with_capacity(dim_count);
+                let mut prod: i64 = 1;
+                for _ in 0..dim_count {
+                    let d = match next_u64() % 12 {
+                        0 => 0i64,
+                        1 => -((next_u64() % 8) as i64 + 1),
+                        _ => ((next_u64() % 4) + 1) as i64,
+                    };
+                    dims.push(d);
+                    prod = prod.saturating_mul(d.max(0));
+                }
+
+                // Build InferInputTensor fields in randomized order, splitting shape across
+                // multiple packed and unpacked tags and optionally duplicating datatype.
+                let mut tensor_fields: Vec<Vec<u8>> = Vec::new();
+                // Name
+                tensor_fields.push(b"\x0a\x03in0".to_vec());
+                // First datatype
+                let mut dt1_f = vec![0x12];
+                push_varint(&mut dt1_f, dt1.len() as u64);
+                dt1_f.extend_from_slice(dt1);
+                tensor_fields.push(dt1_f);
+
+                // Split dims across packed and unpacked records
+                let mut idx = 0;
+                while idx < dims.len() {
+                    if (next_u64() % 2) == 0 {
+                        let mut f = vec![0x18];
+                        push_varint(&mut f, dims[idx] as u64);
+                        tensor_fields.push(f);
+                        idx += 1;
+                    } else {
+                        let take = ((next_u64() % 2) as usize + 1).min(dims.len() - idx);
+                        let mut packed = Vec::new();
+                        for &d in &dims[idx..idx + take] {
+                            push_varint(&mut packed, d as u64);
+                        }
+                        let mut f = vec![0x1A];
+                        push_varint(&mut f, packed.len() as u64);
+                        f.extend_from_slice(&packed);
+                        tensor_fields.push(f);
+                        idx += take;
+                    }
+                }
+
+                // Deterministic Fisher-Yates shuffle of non-duplicate fields
+                for i in (1..tensor_fields.len()).rev() {
+                    let j = (next_u64() as usize) % (i + 1);
+                    tensor_fields.swap(i, j);
+                }
+
+                // Append second datatype after shuffle if testing last-write-wins
+                if has_second_dt {
+                    let mut dt2_f = vec![0x12];
+                    push_varint(&mut dt2_f, dt2.len() as u64);
+                    dt2_f.extend_from_slice(dt2);
+                    tensor_fields.push(dt2_f);
+                }
+
+                if use_inline {
+                    let elem_count = if (next_u64() % 5) == 0 {
+                        (prod + 1).max(0) as usize
+                    } else {
+                        prod.max(0) as usize
+                    };
+                    let c_field = if (next_u64() % 6) == 0 {
+                        2u8 // intentional cross-field mismatch
+                    } else {
+                        kserve_datatype_contents_field(final_dt).unwrap_or(6)
+                    };
+                    let mut c_buf = Vec::new();
+                    match c_field {
+                        1..=5 => {
+                            if (next_u64() % 2) == 0 {
+                                let mut packed = Vec::new();
+                                for _ in 0..elem_count {
+                                    push_varint(&mut packed, 1);
+                                }
+                                c_buf.push((c_field << 3) | 2);
+                                push_varint(&mut c_buf, packed.len() as u64);
+                                c_buf.extend_from_slice(&packed);
+                            } else {
+                                for _ in 0..elem_count {
+                                    c_buf.push(c_field << 3);
+                                    c_buf.push(1);
+                                }
+                            }
+                        }
+                        6 => {
+                            if (next_u64() % 2) == 0 {
+                                c_buf.push((6 << 3) | 2);
+                                push_varint(&mut c_buf, (elem_count * 4) as u64);
+                                c_buf.resize(c_buf.len() + elem_count * 4, 0u8);
+                            } else {
+                                for _ in 0..elem_count {
+                                    c_buf.push((6 << 3) | 5);
+                                    c_buf.extend_from_slice(&[0u8; 4]);
+                                }
+                            }
+                        }
+                        7 => {
+                            c_buf.push((7 << 3) | 2);
+                            push_varint(&mut c_buf, (elem_count * 8) as u64);
+                            c_buf.resize(c_buf.len() + elem_count * 8, 0u8);
+                        }
+                        8 => {
+                            for _ in 0..elem_count {
+                                c_buf.extend_from_slice(b"\x42\x02ab");
+                            }
+                        }
+                        _ => {}
+                    }
+                    let mut f = vec![0x2A];
+                    push_varint(&mut f, c_buf.len() as u64);
+                    f.extend_from_slice(&c_buf);
+                    tensor_fields.push(f);
+                } else {
+                    // Build matching or perturbed raw_input_contents chunk
+                    let mut raw_chunk = Vec::new();
+                    if final_dt == b"BYTES" && dims.iter().all(|&d| d >= 0) {
+                        for _ in 0..(prod as usize) {
+                            let slen = (next_u64() % 5) as u32;
+                            raw_chunk.extend_from_slice(&slen.to_le_bytes());
+                            raw_chunk.resize(raw_chunk.len() + slen as usize, b'x');
+                        }
+                    } else if let Some(w) = kserve_datatype_byte_width(final_dt) {
+                        let nbytes = (prod.max(0) as usize).saturating_mul(w as usize);
+                        raw_chunk.resize(nbytes, 0xAA);
+                    } else {
+                        raw_chunk.resize(8, 0xAA);
+                    }
+                    // Perturb chunk length on 25% of runs
+                    if (next_u64() % 4) == 0 {
+                        raw_chunk.push(0xFF);
+                    }
+                    let mut rf = vec![0x3A];
+                    push_varint(&mut rf, raw_chunk.len() as u64);
+                    rf.extend_from_slice(&raw_chunk);
+                    raw_blobs.push(rf);
+                }
+
+                let tensor_body: Vec<u8> = tensor_fields.into_iter().flatten().collect();
+                let mut inf = vec![0x2A];
+                push_varint(&mut inf, tensor_body.len() as u64);
+                inf.extend_from_slice(&tensor_body);
+                input_blobs.push(inf);
+            }
+
+            msg.extend_from_slice(b"\x0a\x08resnet50");
+            if raws_first {
+                for r in &raw_blobs {
+                    msg.extend_from_slice(r);
+                }
+                for inp in &input_blobs {
+                    msg.extend_from_slice(inp);
+                }
+            } else {
+                for inp in &input_blobs {
+                    msg.extend_from_slice(inp);
+                }
+                for r in &raw_blobs {
+                    msg.extend_from_slice(r);
+                }
+            }
+
+            // Additionally test arbitrary byte-mutated wire streams every 10th iteration
+            if iter % 10 == 9 && !msg.is_empty() {
+                let idx = (next_u64() as usize) % msg.len();
+                msg[idx] ^= (next_u64() & 0xFF) as u8;
+            }
+
+            let custos_ok = inspect_raw_protobuf(&msg, &config).is_ok();
+            let ref_ok = reference_validate_model_infer(&msg, &config);
+            assert_eq!(
+                custos_ok, ref_ok,
+                "differential parser mismatch at iter {iter}: custos={custos_ok}, ref={ref_ok}, bytes={msg:02x?}"
+            );
+            if custos_ok {
+                allowed_count += 1;
+            } else {
+                rejected_count += 1;
+            }
+        }
+
+        assert!(allowed_count > 500, "fuzzer must exercise valid payloads");
+        assert!(rejected_count > 500, "fuzzer must exercise rejected payloads");
     }
 }

@@ -114,8 +114,9 @@ pub struct ScopeFrame {
     pub has_datatype: bool,
     pub elem_byte_width: Option<i64>,
     pub is_bytes_dtype: bool,
+    pub expected_contents_field: Option<u8>,
     pub has_contents: bool,
-    pub contents_elements: i64,
+    pub contents_elements_by_field: [i64; 9],
 }
 
 impl Default for ScopeFrame {
@@ -128,8 +129,9 @@ impl Default for ScopeFrame {
             has_datatype: false,
             elem_byte_width: None,
             is_bytes_dtype: false,
+            expected_contents_field: None,
             has_contents: false,
-            contents_elements: 0,
+            contents_elements_by_field: [0; 9],
         }
     }
 }
@@ -142,8 +144,9 @@ struct InputTensorSpec {
     has_datatype: bool,
     elem_byte_width: Option<i64>,
     is_bytes_dtype: bool,
+    expected_contents_field: Option<u8>,
     has_contents: bool,
-    contents_elements: i64,
+    contents_elements_by_field: [i64; 9],
 }
 
 /// Stack-allocated slice descriptor for a `Root` Field 7 (`raw_input_contents`) chunk.
@@ -163,6 +166,50 @@ pub const fn kserve_datatype_byte_width(raw: &[u8]) -> Option<i64> {
         b"INT32" | b"UINT32" | b"FP32" => Some(4),
         b"INT64" | b"UINT64" | b"FP64" => Some(8),
         _ => None,
+    }
+}
+
+/// Maps a KServe v2 `InferInputTensor.datatype` ASCII slice to the corresponding
+/// `InferTensorContents` Protobuf field number (`1..=8`).
+/// Returns `None` for datatypes without a dedicated `InferTensorContents` field (e.g. `FP16`/`BF16`,
+/// which must use `raw_input_contents` in KServe v2) or unrecognized datatypes.
+#[inline]
+pub const fn kserve_datatype_contents_field(raw: &[u8]) -> Option<u8> {
+    match raw {
+        b"BOOL" => Some(1),
+        b"INT8" | b"INT16" | b"INT32" => Some(2),
+        b"INT64" => Some(3),
+        b"UINT8" | b"UINT16" | b"UINT32" => Some(4),
+        b"UINT64" => Some(5),
+        b"FP32" => Some(6),
+        b"FP64" => Some(7),
+        b"BYTES" => Some(8),
+        _ => None,
+    }
+}
+
+/// Enforces canonical Protobuf wire types for KServe v2 `InferInputTensor` and
+/// `InferTensorContents` fields so a mismatched wire type on `datatype`, `shape`, or
+/// `contents` cannot desynchronize the scanner from downstream `libprotobuf` parsing.
+#[inline]
+const fn is_valid_context_wire_type(context: MsgContext, field_number: u64, wire_type: u8) -> bool {
+    match (context, field_number) {
+        // `InferInputTensor`: 1 (`name`), 2 (`datatype`), 4 (`parameters`), 5 (`contents`) are Wire Type 2;
+        // 3 (`shape`) is repeated int64 (Wire Type 0 unpacked or Wire Type 2 packed).
+        (MsgContext::InputTensor, 1 | 2 | 4 | 5) => wire_type == 2,
+        (MsgContext::InputTensor, 3) => wire_type == 0 || wire_type == 2,
+        // `InferRequestedOutputTensor`: 1 (`name`) and 2 (`parameters`) are Wire Type 2.
+        (MsgContext::OutputTensor, 1 | 2) => wire_type == 2,
+        // `InferTensorContents`:
+        // 1..=5: repeated varint (Wire Type 0 unpacked or Wire Type 2 packed)
+        // 6 (`fp32_contents`): repeated float (Wire Type 5 unpacked or Wire Type 2 packed)
+        // 7 (`fp64_contents`): repeated double (Wire Type 1 unpacked or Wire Type 2 packed)
+        // 8 (`bytes_contents`): repeated bytes (Wire Type 2)
+        (MsgContext::TensorContents, 1..=5) => wire_type == 0 || wire_type == 2,
+        (MsgContext::TensorContents, 6) => wire_type == 5 || wire_type == 2,
+        (MsgContext::TensorContents, 7) => wire_type == 1 || wire_type == 2,
+        (MsgContext::TensorContents, 8) => wire_type == 2,
+        _ => true,
     }
 }
 
@@ -381,9 +428,11 @@ fn close_scope_frame(
         MsgContext::TensorContents => {
             if popped_depth > 0 && frames[popped_depth - 1].context == MsgContext::InputTensor {
                 frames[popped_depth - 1].has_contents = true;
-                frames[popped_depth - 1].contents_elements = frames[popped_depth - 1]
-                    .contents_elements
-                    .saturating_add(frame.contents_elements);
+                for idx in 1..=8 {
+                    frames[popped_depth - 1].contents_elements_by_field[idx] =
+                        frames[popped_depth - 1].contents_elements_by_field[idx]
+                            .saturating_add(frame.contents_elements_by_field[idx]);
+                }
             }
         }
         MsgContext::InputTensor => {
@@ -430,8 +479,9 @@ fn close_scope_frame(
                 has_datatype: frame.has_datatype,
                 elem_byte_width: frame.elem_byte_width,
                 is_bytes_dtype: frame.is_bytes_dtype,
+                expected_contents_field: frame.expected_contents_field,
                 has_contents: frame.has_contents,
-                contents_elements: frame.contents_elements,
+                contents_elements_by_field: frame.contents_elements_by_field,
             };
             *input_specs_len += 1;
         }
@@ -582,6 +632,19 @@ fn inspect_raw_protobuf_with_offset(
             ));
         }
 
+        if matches!(wire_type, 0 | 1 | 2 | 5)
+            && !is_valid_context_wire_type(current_context, field_number, wire_type)
+        {
+            return Err(fail(
+                ParseError::InvalidWireType(wire_type),
+                tag_offset,
+                depth,
+                last_field_number,
+                last_wire_type,
+                report,
+            ));
+        }
+
         match wire_type {
             // Wire Type 0: Base-128 Varint
             0 => {
@@ -629,8 +692,9 @@ fn inspect_raw_protobuf_with_offset(
                 } else if current_context == MsgContext::TensorContents
                     && matches!(field_number, 1..=5)
                 {
-                    frames[depth - 1].contents_elements =
-                        frames[depth - 1].contents_elements.saturating_add(1);
+                    let idx = field_number as usize;
+                    frames[depth - 1].contents_elements_by_field[idx] =
+                        frames[depth - 1].contents_elements_by_field[idx].saturating_add(1);
                 }
             }
 
@@ -667,8 +731,8 @@ fn inspect_raw_protobuf_with_offset(
                     ));
                 }
                 if current_context == MsgContext::TensorContents && field_number == 7 {
-                    frames[depth - 1].contents_elements =
-                        frames[depth - 1].contents_elements.saturating_add(1);
+                    frames[depth - 1].contents_elements_by_field[7] =
+                        frames[depth - 1].contents_elements_by_field[7].saturating_add(1);
                 }
                 cursor = next_cursor;
             }
@@ -743,7 +807,7 @@ fn inspect_raw_protobuf_with_offset(
 
                 match (current_context, field_number) {
                     // Root string fields: 1 = model_name, 2 = model_version, 3 = id
-                    (MsgContext::Root, 1 | 2 | 3) => {
+                    (MsgContext::Root, 1..=3) => {
                         report.skipped_bulk_bytes = report.skipped_bulk_bytes.saturating_add(len);
                         cursor = submsg_end;
                     }
@@ -876,6 +940,8 @@ fn inspect_raw_protobuf_with_offset(
                         frames[depth - 1].has_datatype = true;
                         frames[depth - 1].elem_byte_width = kserve_datatype_byte_width(dt_slice);
                         frames[depth - 1].is_bytes_dtype = dt_slice == b"BYTES";
+                        frames[depth - 1].expected_contents_field =
+                            kserve_datatype_contents_field(dt_slice);
                         report.skipped_bulk_bytes = report.skipped_bulk_bytes.saturating_add(len);
                         cursor = submsg_end;
                     }
@@ -914,6 +980,7 @@ fn inspect_raw_protobuf_with_offset(
                     // TensorContents packed repeated fields:
                     // Fields 1..=5: packed varints (bool, int32, int64, uint32, uint64).
                     (MsgContext::TensorContents, 1..=5) => {
+                        let idx = field_number as usize;
                         while cursor < submsg_end {
                             report.tags_scanned = report.tags_scanned.saturating_add(1);
                             if config.max_tags_scanned > 0
@@ -952,8 +1019,8 @@ fn inspect_raw_protobuf_with_offset(
                                     report,
                                 ));
                             }
-                            frames[depth - 1].contents_elements =
-                                frames[depth - 1].contents_elements.saturating_add(1);
+                            frames[depth - 1].contents_elements_by_field[idx] =
+                                frames[depth - 1].contents_elements_by_field[idx].saturating_add(1);
                         }
                     }
 
@@ -969,8 +1036,8 @@ fn inspect_raw_protobuf_with_offset(
                                 report,
                             ));
                         }
-                        frames[depth - 1].contents_elements = frames[depth - 1]
-                            .contents_elements
+                        frames[depth - 1].contents_elements_by_field[6] = frames[depth - 1]
+                            .contents_elements_by_field[6]
                             .saturating_add((len / 4) as i64);
                         report.skipped_bulk_bytes = report.skipped_bulk_bytes.saturating_add(len);
                         cursor = submsg_end;
@@ -988,8 +1055,8 @@ fn inspect_raw_protobuf_with_offset(
                                 report,
                             ));
                         }
-                        frames[depth - 1].contents_elements = frames[depth - 1]
-                            .contents_elements
+                        frames[depth - 1].contents_elements_by_field[7] = frames[depth - 1]
+                            .contents_elements_by_field[7]
                             .saturating_add((len / 8) as i64);
                         report.skipped_bulk_bytes = report.skipped_bulk_bytes.saturating_add(len);
                         cursor = submsg_end;
@@ -997,8 +1064,8 @@ fn inspect_raw_protobuf_with_offset(
 
                     // TensorContents Field 8 (`bytes_contents` repeated bytes):
                     (MsgContext::TensorContents, 8) => {
-                        frames[depth - 1].contents_elements =
-                            frames[depth - 1].contents_elements.saturating_add(1);
+                        frames[depth - 1].contents_elements_by_field[8] =
+                            frames[depth - 1].contents_elements_by_field[8].saturating_add(1);
                         report.skipped_bulk_bytes = report.skipped_bulk_bytes.saturating_add(len);
                         cursor = submsg_end;
                     }
@@ -1125,8 +1192,8 @@ fn inspect_raw_protobuf_with_offset(
                     ));
                 }
                 if current_context == MsgContext::TensorContents && field_number == 6 {
-                    frames[depth - 1].contents_elements =
-                        frames[depth - 1].contents_elements.saturating_add(1);
+                    frames[depth - 1].contents_elements_by_field[6] =
+                        frames[depth - 1].contents_elements_by_field[6].saturating_add(1);
                 }
                 cursor = next_cursor;
             }
@@ -1271,12 +1338,33 @@ fn inspect_raw_protobuf_with_offset(
             if any_inline_contents {
                 let width = spec.elem_byte_width.unwrap_or(4) as usize;
                 let expected_elems = usize::try_from(spec.shape_product).unwrap_or(usize::MAX);
-                let actual_elems = usize::try_from(spec.contents_elements).unwrap_or(0);
-                if !spec.has_contents || actual_elems != expected_elems {
+                let Some(expected_field) = spec.expected_contents_field else {
                     return Err(fail(
                         ParseError::PayloadSizeMismatch {
                             expected_bytes: expected_elems.saturating_mul(width),
-                            actual_bytes: actual_elems.saturating_mul(width),
+                            actual_bytes: 0,
+                        },
+                        cursor,
+                        0,
+                        last_field_number,
+                        last_wire_type,
+                        report,
+                    ));
+                };
+                let matching_elems =
+                    usize::try_from(spec.contents_elements_by_field[expected_field as usize])
+                        .unwrap_or(0);
+                let has_foreign_field_elems = (1usize..=8).any(|f| {
+                    f != expected_field as usize && spec.contents_elements_by_field[f] > 0
+                });
+                if !spec.has_contents
+                    || has_foreign_field_elems
+                    || matching_elems != expected_elems
+                {
+                    return Err(fail(
+                        ParseError::PayloadSizeMismatch {
+                            expected_bytes: expected_elems.saturating_mul(width),
+                            actual_bytes: matching_elems.saturating_mul(width),
                         },
                         cursor,
                         0,

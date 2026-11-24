@@ -1,10 +1,10 @@
 # Topology B (Baseline): Envoy Proxy without Custos ext_proc filter.
-# Forwards downstream gRPC KServe v2 inference traffic on 0.0.0.0:8001 -> 127.0.0.1:9001.
+# Forwards downstream gRPC KServe v2 inference traffic on 0.0.0.0:8002 -> 127.0.0.1:9001.
 admin:
   address:
     socket_address:
       address: 127.0.0.1
-      port_value: 9901
+      port_value: 9902
 
 static_resources:
   listeners:
@@ -12,7 +12,7 @@ static_resources:
       address:
         socket_address:
           address: 0.0.0.0
-          port_value: 8001
+          port_value: 8002
       per_connection_buffer_limit_bytes: 16777216 # 16 MiB
       filter_chains:
         - filters:
@@ -37,7 +37,9 @@ static_resources:
                           http_status: "%RESPONSE_CODE%"
                           grpc_status: "%GRPC_STATUS%"
                           response_code_details: "%RESPONSE_CODE_DETAILS%"
+                          response_flags: "%RESPONSE_FLAGS%"
                           bytes_received: "%BYTES_RECEIVED%"
+                          upstream_wire_bytes_sent: "%UPSTREAM_WIRE_BYTES_SENT%"
                           duration_ms: "%DURATION%"
                           upstream_host: "%UPSTREAM_HOST%"
                 http2_protocol_options:

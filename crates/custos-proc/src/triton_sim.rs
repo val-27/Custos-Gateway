@@ -147,10 +147,10 @@ fn build_kserve_response() -> Bytes {
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut port: u16 = 9001;
     for arg in std::env::args().skip(1) {
-        if let Some(val) = arg.strip_prefix("--grpc-port=") {
-            if let Ok(p) = val.parse::<u16>() {
-                port = p;
-            }
+        if let Some(val) = arg.strip_prefix("--grpc-port=")
+            && let Ok(p) = val.parse::<u16>()
+        {
+            port = p;
         }
     }
     let addr: SocketAddr = ([0, 0, 0, 0], port).into();
